@@ -1,0 +1,14 @@
+{
+  "name": "vetra-payments",
+  "version": "1.0.0",
+  "description": "Simple Authorize.Net payment bridge",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  },
+  "type": "module"
+}
