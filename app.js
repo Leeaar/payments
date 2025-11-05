@@ -7,7 +7,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL =
-  process.env.BASE_URL || "https://payments-nleq.onrender.com"; // change if your render url is different
+  process.env.BASE_URL || "https://payments-nleq.onrender.com";
+const ZOHO_REDIRECT_URI =
+  "https://payments-nleq.onrender.com/oauth/callback";
 
 // ======================================================
 // 1) ZOHO HELPERS
@@ -18,6 +20,7 @@ async function getZohoAccessToken() {
     client_id: process.env.ZOHO_CLIENT_ID,
     client_secret: process.env.ZOHO_CLIENT_SECRET,
     grant_type: "refresh_token",
+    redirect_uri: ZOHO_REDIRECT_URI, // 👈 add this
   });
 
   const resp = await fetch("https://accounts.zoho.com/oauth/v2/token", {
@@ -146,17 +149,17 @@ app.get("/", (req, res) => {
   res.send("<h2>Payments service is running.</h2>");
 });
 
-// show what env the server actually has (masked)
+// show env (masked)
 app.get("/debug/env", (req, res) => {
   res.json({
     ZOHO_CLIENT_ID: (process.env.ZOHO_CLIENT_ID || "").slice(0, 20),
     ZOHO_CLIENT_SECRET_LEN: (process.env.ZOHO_CLIENT_SECRET || "").length,
-    ZOHO_REFRESH_TOKEN: (process.env.ZOHO_REFRESH_TOKEN || "").slice(0, 30),
+    ZOHO_REFRESH_TOKEN: (process.env.ZOHO_REFRESH_TOKEN || "").slice(0, 40),
     ZOHO_ORG_ID: process.env.ZOHO_ORG_ID || "",
   });
 });
 
-// debug zoho token
+// 👇 updated to send redirect_uri
 app.get("/debug/zoho-token", async (req, res) => {
   try {
     const params = new URLSearchParams({
@@ -164,6 +167,7 @@ app.get("/debug/zoho-token", async (req, res) => {
       client_id: process.env.ZOHO_CLIENT_ID,
       client_secret: process.env.ZOHO_CLIENT_SECRET,
       grant_type: "refresh_token",
+      redirect_uri: ZOHO_REDIRECT_URI,
     });
 
     const resp = await fetch("https://accounts.zoho.com/oauth/v2/token", {
