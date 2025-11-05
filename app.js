@@ -9,16 +9,6 @@ const PORT = process.env.PORT || 3000;
 const BASE_URL =
   process.env.BASE_URL || "https://payments-nleq.onrender.com"; // change if your render url is different
 
-/**
- * REQUIRED ENV VARS (Render -> Environment):
- * ANET_LOGIN
- * ANET_KEY
- * ZOHO_CLIENT_ID
- * ZOHO_CLIENT_SECRET
- * ZOHO_REFRESH_TOKEN
- * ZOHO_ORG_ID  (yours was 852929343)
- */
-
 // ======================================================
 // 1) ZOHO HELPERS
 // ======================================================
@@ -36,7 +26,6 @@ async function getZohoAccessToken() {
   });
 
   const json = await resp.json();
-  // if Zoho says no, we want to see it in logs
   if (!json.access_token) {
     console.error("Zoho token error:", json);
     throw new Error("Could not get Zoho access token");
@@ -152,18 +141,22 @@ async function getAuthorizeNetHostedToken({ amount, invoiceId, invoiceNumber }) 
 // 3) ROUTES
 // ======================================================
 
-// a) root
+// root
 app.get("/", (req, res) => {
   res.send("<h2>Payments service is running.</h2>");
 });
 
-// b) OAuth callback (just so Zoho has somewhere to send you)
-app.get("/oauth/callback", (req, res) => {
-  const code = req.query.code;
-  res.send(`<h2>Zoho OAuth code received</h2><pre>${code || "no code"}</pre>`);
+// show what env the server actually has (masked)
+app.get("/debug/env", (req, res) => {
+  res.json({
+    ZOHO_CLIENT_ID: (process.env.ZOHO_CLIENT_ID || "").slice(0, 20),
+    ZOHO_CLIENT_SECRET_LEN: (process.env.ZOHO_CLIENT_SECRET || "").length,
+    ZOHO_REFRESH_TOKEN: (process.env.ZOHO_REFRESH_TOKEN || "").slice(0, 30),
+    ZOHO_ORG_ID: process.env.ZOHO_ORG_ID || "",
+  });
 });
 
-// c) DEBUG: see what Zoho is actually returning for your env vars
+// debug zoho token
 app.get("/debug/zoho-token", async (req, res) => {
   try {
     const params = new URLSearchParams({
@@ -185,7 +178,13 @@ app.get("/debug/zoho-token", async (req, res) => {
   }
 });
 
-// d) start payment: /pay?invoice_id=5032827000006984109
+// Zoho OAuth callback
+app.get("/oauth/callback", (req, res) => {
+  const code = req.query.code;
+  res.send(`<h2>Zoho OAuth code received</h2><pre>${code || "no code"}</pre>`);
+});
+
+// start payment
 app.get("/pay", async (req, res) => {
   try {
     const invoiceId = req.query.invoice_id;
@@ -193,7 +192,6 @@ app.get("/pay", async (req, res) => {
       return res.status(400).send("Missing invoice_id");
     }
 
-    // 1. fetch invoice from Zoho
     const invoice = await getZohoInvoice(invoiceId);
     if (invoice.error) {
       return res
@@ -201,16 +199,13 @@ app.get("/pay", async (req, res) => {
         .send("Could not fetch invoice from Zoho: " + invoice.error);
     }
 
-    // 2. use balance or total
     const amount = invoice.balance || invoice.total;
-    // 3. get Authorize.Net hosted token
     const anetToken = await getAuthorizeNetHostedToken({
       amount,
       invoiceId,
       invoiceNumber: invoice.invoice_number,
     });
 
-    // 4. auto-post to Authorize.Net
     res.send(`
       <html>
         <body>
@@ -230,12 +225,12 @@ app.get("/pay", async (req, res) => {
   }
 });
 
-// e) payment cancelled
+// cancelled
 app.get("/payment-cancelled", (req, res) => {
   res.send("<h2>Payment cancelled.</h2>");
 });
 
-// f) payment success (simple version)
+// success (simple)
 app.get("/payment-success", async (req, res) => {
   try {
     const invoiceId = req.query.invoice_id;
@@ -294,9 +289,7 @@ app.get("/payment-success", async (req, res) => {
   }
 });
 
-// ======================================================
-// START SERVER
-// ======================================================
+// start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
