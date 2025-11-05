@@ -1,35 +1,33 @@
-// =============================
-// Imports & setup
-// =============================
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// needed so ANet can send us JSON later
+// we’ll use express.json for most routes
 app.use(express.json());
 
 // =============================
-// Env vars (from Render)
+// ENV VARS
 // =============================
 const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
 const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID || "852929343";
 
-const ANET_LOGIN = process.env.ANET_LOGIN;      // your Authorize.Net API Login ID
-const ANET_KEY = process.env.ANET_KEY;          // your Authorize.Net Transaction Key
+const ANET_LOGIN = process.env.ANET_LOGIN;
+const ANET_KEY = process.env.ANET_KEY;
+const ANET_WEBHOOK_KEY = process.env.ANET_WEBHOOK_KEY; // Signature Key from ANet
 
-// your public Render URL
 const BASE_URL =
   process.env.BASE_URL || "https://payments-nleq.onrender.com";
 
 // =============================
-// Zoho access token cache
+// ZOHO TOKEN CACHE
 // =============================
 let zohoTokenCache = {
   access_token: null,
@@ -71,7 +69,7 @@ async function getZohoAccessToken() {
 }
 
 // =============================
-// Helper: get invoice from Zoho
+// ZOHO HELPERS
 // =============================
 async function getZohoInvoice(invoiceId) {
   const accessToken = await getZohoAccessToken();
@@ -89,8 +87,43 @@ async function getZohoInvoice(invoiceId) {
   return data.invoice;
 }
 
+async function createZohoPaymentForInvoiceAmount(invoice, amount) {
+  const accessToken = await getZohoAccessToken();
+  const payload = {
+    customer_id: invoice.customer_id,
+    amount: amount,
+    date: new Date().toISOString().slice(0, 10),
+    invoices: [
+      {
+        invoice_id: invoice.invoice_id,
+        amount_applied: amount,
+      },
+    ],
+  };
+
+  const resp = await fetch(
+    `https://www.zohoapis.com/books/v3/customerpayments?organization_id=${ZOHO_ORG_ID}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Zoho-oauthtoken ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const data = await resp.json();
+  if (data.code !== 0) {
+    console.error("Zoho payment create failed:", data);
+    throw new Error(data.message || "Zoho did not accept payment");
+  }
+  console.log("✅ Payment recorded in Zoho:", data.payment_id);
+  return data;
+}
+
 // =============================
-// Helper: get Authorize.Net hosted payment token
+// AUTHORIZE.NET HELPER
 // =============================
 async function getAuthorizeNetToken({ amount, invoiceId, invoiceNumber }) {
   if (!ANET_LOGIN || !ANET_KEY) {
@@ -115,7 +148,7 @@ async function getAuthorizeNetToken({ amount, invoiceId, invoiceNumber }) {
         amount: Number(amount).toFixed(2),
         order: {
           invoiceNumber: invoiceNumber || invoiceId,
-          // stash zoho invoice id so it comes back in webhook later
+          // stash the Zoho invoice id so it shows up in webhook
           description: `zoho_invoice_id=${invoiceId}`,
         },
       },
@@ -156,23 +189,20 @@ async function getAuthorizeNetToken({ amount, invoiceId, invoiceNumber }) {
 // ROUTES
 // =============================
 
-// health
 app.get("/", (req, res) => {
   res.send("✅ Zoho + Authorize.Net payment service is running.");
 });
 
-// debug env
 app.get("/debug/env", (req, res) => {
   res.json({
-    ZOHO_CLIENT_ID: ZOHO_CLIENT_ID ? "loaded" : "missing",
+    ZOHO_CLIENT_ID: !!ZOHO_CLIENT_ID,
     ZOHO_ORG_ID,
-    ANET_LOGIN: ANET_LOGIN ? "loaded" : "missing",
-    ANET_KEY: ANET_KEY ? "loaded" : "missing",
-    BASE_URL,
+    ANET_LOGIN: !!ANET_LOGIN,
+    ANET_KEY: !!ANET_KEY,
+    ANET_WEBHOOK_KEY: !!ANET_WEBHOOK_KEY,
   });
 });
 
-// debug zoho token
 app.get("/debug/zoho-token", async (req, res) => {
   try {
     const token = await getZohoAccessToken();
@@ -182,7 +212,6 @@ app.get("/debug/zoho-token", async (req, res) => {
   }
 });
 
-// raw invoice view (what you just tested)
 app.get("/invoice/:id", async (req, res) => {
   try {
     const invoice = await getZohoInvoice(req.params.id);
@@ -193,7 +222,6 @@ app.get("/invoice/:id", async (req, res) => {
 });
 
 // main payment route
-// usage: /pay?invoice_id=5032827000008443267
 app.get("/pay", async (req, res) => {
   const invoiceId = req.query.invoice_id;
   if (!invoiceId) {
@@ -201,19 +229,16 @@ app.get("/pay", async (req, res) => {
   }
 
   try {
-    // 1) get invoice from zoho
     const invoice = await getZohoInvoice(invoiceId);
     const amount = invoice.balance || invoice.total;
     const invoiceNumber = invoice.invoice_number;
 
-    // 2) get ANet hosted payment token
     const anetToken = await getAuthorizeNetToken({
       amount,
       invoiceId,
       invoiceNumber,
     });
 
-    // 3) auto-post to ANet
     res.send(`
       <html>
         <body>
@@ -233,23 +258,89 @@ app.get("/pay", async (req, res) => {
   }
 });
 
-// simple success / cancel placeholders
 app.get("/payment-success", (req, res) => {
   res.send("<h2>Payment successful.</h2>");
 });
+
 app.get("/payment-cancelled", (req, res) => {
   res.send("<h2>Payment cancelled.</h2>");
 });
 
 // =============================
-// TEMP Authorize.Net webhook
+// REAL Authorize.Net webhook
 // =============================
-// This is ONLY so you can save the webhook in the ANet dashboard.
-// After ANet accepts it, we can replace this with the real verified one.
-app.post("/anet-webhook", (req, res) => {
-  console.log("✅ Authorize.Net webhook ping received:", req.body);
-  res.status(200).send("ok");
-});
+// we need raw body for signature, so define route separately
+app.post(
+  "/anet-webhook",
+  express.raw({ type: "*/*" }),
+  async (req, res) => {
+    try {
+      // 1) verify signature
+      const sigHeader = req.headers["x-anet-signature"];
+      if (!sigHeader || !sigHeader.startsWith("SHA512=")) {
+        console.error("Missing or bad signature header");
+        return res.status(401).send("bad signature");
+      }
+
+      const sentSig = sigHeader.split("=", 2)[1];
+      const rawBody = req.body; // Buffer
+
+      // Signature Key from ANet is hex, so use as-is
+      const hmac = crypto
+        .createHmac("sha512", Buffer.from(ANET_WEBHOOK_KEY, "hex"))
+        .update(rawBody)
+        .digest("hex");
+
+      if (hmac.toLowerCase() !== sentSig.toLowerCase()) {
+        console.error("Signature mismatch");
+        return res.status(401).send("invalid signature");
+      }
+
+      // 2) parse JSON now that signature is verified
+      const event = JSON.parse(rawBody.toString());
+      console.log("✅ Verified ANet webhook:", event.eventType);
+
+      if (
+        event.eventType !== "net.authorize.payment.authcapture.created"
+      ) {
+        // we only care about successful captures
+        return res.status(200).send("ignored");
+      }
+
+      const payload = event.payload || {};
+      const amount = payload.authAmount;
+      const invoiceNumber = payload.invoiceNumber || "";
+      const description = payload.description || "";
+
+      // try to pull Zoho invoice id from description
+      let zohoInvoiceId = null;
+      const match = description.match(/zoho_invoice_id=([A-Za-z0-9]+)/);
+      if (match) {
+        zohoInvoiceId = match[1];
+      } else {
+        // fallback: maybe we used the Zoho invoice id as invoiceNumber
+        zohoInvoiceId = invoiceNumber;
+      }
+
+      if (!zohoInvoiceId) {
+        console.error("Could not determine Zoho invoice id from webhook");
+        return res.status(200).send("no invoice found");
+      }
+
+      // 3) fetch invoice from Zoho
+      const invoice = await getZohoInvoice(zohoInvoiceId);
+
+      // 4) create payment in Zoho for the captured amount
+      await createZohoPaymentForInvoiceAmount(invoice, amount);
+
+      return res.status(200).send("ok");
+    } catch (err) {
+      console.error("Error handling ANet webhook:", err);
+      // still return 200 so ANet doesn't retry like crazy
+      return res.status(200).send("logged error");
+    }
+  }
+);
 
 // =============================
 // Start server
@@ -257,3 +348,4 @@ app.post("/anet-webhook", (req, res) => {
 app.listen(PORT, () => {
   console.log(`server running on port ${PORT}`);
 });
+
