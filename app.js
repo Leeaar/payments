@@ -1,90 +1,102 @@
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import bodyParser from "body-parser";
 
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json());
+const PORT = process.env.PORT || 3000;
 
-// ====== Environment Variables ======
-const {
-  ZOHO_CLIENT_ID,
-  ZOHO_CLIENT_SECRET,
-  ZOHO_REFRESH_TOKEN,
-  ZOHO_ORG_ID
-} = process.env;
+// pull from env (what you put in Render)
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID || "852929343";
 
-let accessToken = null;
-let tokenExpiry = 0;
+// simple in-memory cache so we don’t spam Zoho
+let zohoTokenCache = {
+  access_token: null,
+  expires_at: 0,
+};
 
-// ====== TOKEN REFRESH ======
+// get or refresh an access token
 async function getZohoAccessToken() {
   const now = Date.now();
-  if (accessToken && now < tokenExpiry) {
-    return accessToken;
+  if (zohoTokenCache.access_token && zohoTokenCache.expires_at > now + 5000) {
+    return zohoTokenCache.access_token;
   }
 
-  console.log("🔁 Refreshing Zoho access token...");
-  const body = new URLSearchParams({
+  const params = new URLSearchParams({
     refresh_token: ZOHO_REFRESH_TOKEN,
     client_id: ZOHO_CLIENT_ID,
     client_secret: ZOHO_CLIENT_SECRET,
-    grant_type: "refresh_token"
+    grant_type: "refresh_token",
   });
 
-  const response = await fetch("https://accounts.zoho.com/oauth/v2/token", {
+  const resp = await fetch("https://accounts.zoho.com/oauth/v2/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body
+    body: params,
   });
 
-  const data = await response.json();
-  if (!response.ok || data.error) {
-    console.error("❌ Zoho token refresh failed:", data);
-    throw new Error("Could not get Zoho access token");
+  const data = await resp.json();
+
+  if (!data.access_token) {
+    console.error("Zoho token error:", data);
+    throw new Error(data.error_description || "Could not get Zoho access token");
   }
 
-  accessToken = data.access_token;
-  tokenExpiry = now + 1000 * (data.expires_in - 60);
-  console.log("✅ Got new Zoho access token");
-  return accessToken;
+  zohoTokenCache.access_token = data.access_token;
+  // expires_in is in seconds
+  zohoTokenCache.expires_at = Date.now() + (data.expires_in || 3600) * 1000;
+
+  return data.access_token;
 }
 
-// ====== GET INVOICE DETAILS ======
-app.get("/invoice/:id", async (req, res) => {
-  try {
-    const token = await getZohoAccessToken();
-    const invoiceId = req.params.id;
-    const url = `https://www.zohoapis.com/books/v3/invoices/${invoiceId}?organization_id=${ZOHO_ORG_ID}`;
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Zoho-oauthtoken ${token}` }
-    });
-
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.error("Invoice fetch error:", err);
-    res.status(500).json({ error: "Failed to fetch invoice" });
-  }
+// root
+app.get("/", (req, res) => {
+  res.send("✅ payments service is running");
 });
 
-// ====== DEBUG TOKEN ======
+// debug to see what env the server sees
+app.get("/debug/env", (req, res) => {
+  res.json({
+    ZOHO_CLIENT_ID: ZOHO_CLIENT_ID?.slice(0, 25),
+    ZOHO_REFRESH_TOKEN: ZOHO_REFRESH_TOKEN?.slice(0, 35),
+    ZOHO_ORG_ID,
+  });
+});
+
+// debug to see current token
 app.get("/debug/zoho-token", async (req, res) => {
   try {
     const token = await getZohoAccessToken();
     res.json({ access_token: token });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ====== TEST ROUTE ======
-app.get("/", (req, res) => {
-  res.send("✅ Payments service is running.");
+// 👉 actual route you tried to hit
+app.get("/invoice/:id", async (req, res) => {
+  const invoiceId = req.params.id;
+  try {
+    const accessToken = await getZohoAccessToken();
+
+    const url = `https://www.zohoapis.com/books/v3/invoices/${invoiceId}?organization_id=${ZOHO_ORG_ID}`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Zoho-oauthtoken ${accessToken}`,
+      },
+    });
+
+    const data = await resp.json();
+    res.json(data);
+  } catch (e) {
+    console.error("invoice fetch error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`server running on port ${PORT}`);
+});
