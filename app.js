@@ -20,7 +20,7 @@ const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID || "852929343";
 
 const ANET_LOGIN = process.env.ANET_LOGIN;
 const ANET_KEY = process.env.ANET_KEY;
-const ANET_WEBHOOK_KEY = process.env.ANET_WEBHOOK_KEY; // Signature Key (hex)
+const ANET_WEBHOOK_KEY = process.env.ANET_WEBHOOK_KEY; // Authorize.Net Signature Key (hex)
 const BASE_URL =
   process.env.BASE_URL || "https://payments-nleq.onrender.com";
 
@@ -88,13 +88,20 @@ async function getZohoInvoice(invoiceId) {
   return data.invoice;
 }
 
-async function createZohoPaymentForInvoiceAmount(invoice, amount) {
+async function createZohoPaymentForInvoiceAmount(
+  invoice,
+  amount,
+  opts = {},
+) {
   const accessToken = await getZohoAccessToken();
 
   const payload = {
     customer_id: invoice.customer_id,
     amount: amount,
     date: new Date().toISOString().slice(0, 10),
+    payment_mode: "Authorize.Net", // 👈 show correct payment mode
+    reference_number: opts.reference_number || "",
+    description: opts.description || "",
     invoices: [
       {
         invoice_id: invoice.invoice_id,
@@ -121,14 +128,13 @@ async function createZohoPaymentForInvoiceAmount(invoice, amount) {
     throw new Error(data.message || "Zoho did not accept payment");
   }
 
-  console.log("✅ Payment recorded in Zoho:", data.payment_id);
+  console.log("✅ Payment recorded in Zoho:", data);
   return data;
 }
 
 // =====================================================
-// 1) AUTHORIZE.NET WEBHOOK (RAW FIRST)
+// 1) AUTHORIZE.NET WEBHOOK – RAW FIRST
 // =====================================================
-// Must be BEFORE app.use(express.json())
 app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
   console.log("=== ANet webhook hit ===");
   console.log("Headers:", req.headers);
@@ -141,7 +147,7 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
   if (sigHeader && ANET_WEBHOOK_KEY) {
     const lower = sigHeader.toLowerCase();
     if (lower.startsWith("sha512=")) {
-      const sentSig = lower.split("=", 2)[1]; // hex string from ANet
+      const sentSig = lower.split("=", 2)[1];
       const computed = crypto
         .createHmac("sha512", Buffer.from(ANET_WEBHOOK_KEY, "hex"))
         .update(req.body)
@@ -181,39 +187,27 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
 
   const payload = event.payload || {};
   const amount = payload.authAmount;
-  // THIS is what ANet sent us in your log: "INV-001293"
-  const anetInvoiceNumber = payload.invoiceNumber || "";
-  const description = payload.description || "";
+  const anetTxnId = payload.id; // 👈 Authorize.Net transaction id
+  const anetInvoiceNumber = payload.invoiceNumber || ""; // should now be Zoho internal ID
 
-  // ---- determine Zoho invoice ID ----
-  // best case: the invoice number IS the Zoho ID (after we fix /pay)
-  let zohoInvoiceId = null;
-
-  // if it's all digits, assume it's our Zoho invoice id
-  if (/^\d+$/.test(anetInvoiceNumber)) {
-    zohoInvoiceId = anetInvoiceNumber;
-  } else {
-    // try to pull from description if ANet included it
-    const m = description.match(/zoho_invoice_id=([A-Za-z0-9]+)/);
-    if (m) {
-      zohoInvoiceId = m[1];
-    }
-  }
+  // we expect this to now be the real Zoho invoice ID (because we sent it in /pay)
+  const zohoInvoiceId = anetInvoiceNumber;
 
   if (!zohoInvoiceId) {
-    console.log(
-      "❌ Could not determine Zoho invoice id from webhook. Got invoiceNumber=",
-      anetInvoiceNumber,
-      "description=",
-      description,
-    );
+    console.log("❌ No Zoho invoice id in webhook");
     return res.status(200).send("no invoice id");
   }
 
-  // proceed to mark in Zoho
+  // fetch invoice so we can log pretty number in Zoho payment
   try {
     const invoice = await getZohoInvoice(zohoInvoiceId);
-    await createZohoPaymentForInvoiceAmount(invoice, amount);
+    const pretty = invoice.invoice_number;
+
+    await createZohoPaymentForInvoiceAmount(invoice, amount, {
+      reference_number: anetTxnId,
+      description: `Invoice ${pretty} paid via Authorize.Net`,
+    });
+
     console.log(
       "✅ Recorded payment in Zoho for",
       zohoInvoiceId,
@@ -228,7 +222,7 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
 });
 
 // =====================================================
-// 2) NOW parse JSON for the rest
+// 2) parse JSON for everything else
 // =====================================================
 app.use(express.json());
 
@@ -260,7 +254,7 @@ app.get("/debug/zoho-token", async (req, res) => {
 });
 
 // =============================
-// RAW INVOICE VIEW
+// VIEW INVOICE RAW
 // =============================
 app.get("/invoice/:id", async (req, res) => {
   try {
@@ -274,7 +268,7 @@ app.get("/invoice/:id", async (req, res) => {
 // =============================
 // AUTHORIZE.NET TOKEN HELPER
 // =============================
-async function getAuthorizeNetToken({ amount, invoiceId /* real Zoho ID */ }) {
+async function getAuthorizeNetToken({ amount, invoiceId, prettyNumber }) {
   if (!ANET_LOGIN || !ANET_KEY) {
     throw new Error("Authorize.Net credentials missing");
   }
@@ -296,10 +290,10 @@ async function getAuthorizeNetToken({ amount, invoiceId /* real Zoho ID */ }) {
         transactionType: "authCaptureTransaction",
         amount: Number(amount).toFixed(2),
         order: {
-          // IMPORTANT: send Zoho's REAL invoice id here
+          // send Zoho's internal ID as invoiceNumber, so webhook can map it back
           invoiceNumber: invoiceId,
-          // we can still stash it in description too
-          description: `zoho_invoice_id=${invoiceId}`,
+          // but show the pretty number as description
+          description: prettyNumber ? `Invoice ${prettyNumber}` : "Invoice",
         },
       },
       hostedPaymentSettings: {
@@ -345,13 +339,14 @@ app.get("/pay", async (req, res) => {
   }
 
   try {
-    // this returns the Zoho invoice, so we know invoiceId is the real internal id
     const invoice = await getZohoInvoice(invoiceId);
     const amount = invoice.balance || invoice.total;
+    const prettyNumber = invoice.invoice_number; // e.g. INV-001293
 
     const anetToken = await getAuthorizeNetToken({
       amount,
-      invoiceId, // send REAL Zoho ID to ANet
+      invoiceId,      // real Zoho ID
+      prettyNumber,   // human invoice number for description
     });
 
     res.send(`
