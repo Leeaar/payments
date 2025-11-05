@@ -1,6 +1,7 @@
 {
   "name": "vetra-payments",
   "version": "1.0.0",
+  "description": "Payment bridge for Zoho Books invoices",
   "main": "app.js",
   "type": "module",
   "scripts": {
@@ -9,7 +10,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "body-parser": "^1.20.2"
   }
 }
