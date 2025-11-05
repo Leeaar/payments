@@ -99,7 +99,7 @@ async function createZohoPaymentForInvoiceAmount(
     customer_id: invoice.customer_id,
     amount: amount,
     date: new Date().toISOString().slice(0, 10),
-    payment_mode: "Authorize.Net", // 👈 show correct payment mode
+    payment_mode: "Authorize.Net", // 👈 your label
     reference_number: opts.reference_number || "",
     description: opts.description || "",
     invoices: [
@@ -187,10 +187,9 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
 
   const payload = event.payload || {};
   const amount = payload.authAmount;
-  const anetTxnId = payload.id; // 👈 Authorize.Net transaction id
-  const anetInvoiceNumber = payload.invoiceNumber || ""; // should now be Zoho internal ID
+  const anetTxnId = payload.id; // Authorize.Net transaction id
+  const anetInvoiceNumber = payload.invoiceNumber || ""; // should be Zoho internal ID now
 
-  // we expect this to now be the real Zoho invoice ID (because we sent it in /pay)
   const zohoInvoiceId = anetInvoiceNumber;
 
   if (!zohoInvoiceId) {
@@ -198,22 +197,35 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
     return res.status(200).send("no invoice id");
   }
 
-  // fetch invoice so we can log pretty number in Zoho payment
+  // fetch invoice so we can see balance and pretty number
   try {
     const invoice = await getZohoInvoice(zohoInvoiceId);
     const pretty = invoice.invoice_number;
+    const invoiceBalance = Number(invoice.balance || 0);
+    const paymentAmount = Number(amount || 0);
 
-    await createZohoPaymentForInvoiceAmount(invoice, amount, {
-      reference_number: anetTxnId,
-      description: `Invoice ${pretty} paid via Authorize.Net`,
-    });
-
-    console.log(
-      "✅ Recorded payment in Zoho for",
-      zohoInvoiceId,
-      "amount",
-      amount,
-    );
+    // 👇 guard against already-paid or overpayment
+    if (invoiceBalance <= 0) {
+      console.log(
+        "ℹ️ Invoice has no balance left in Zoho, skipping payment. Invoice:",
+        zohoInvoiceId,
+      );
+    } else if (paymentAmount > invoiceBalance + 0.0001) {
+      console.log(
+        `ℹ️ Payment (${paymentAmount}) is more than invoice balance (${invoiceBalance}), skipping.`,
+      );
+    } else {
+      await createZohoPaymentForInvoiceAmount(invoice, paymentAmount, {
+        reference_number: anetTxnId,
+        description: `Invoice ${pretty} paid via Authorize.Net`,
+      });
+      console.log(
+        "✅ Recorded payment in Zoho for",
+        zohoInvoiceId,
+        "amount",
+        paymentAmount,
+      );
+    }
   } catch (err) {
     console.log("❌ Error recording payment in Zoho:", err);
   }
@@ -292,7 +304,7 @@ async function getAuthorizeNetToken({ amount, invoiceId, prettyNumber }) {
         order: {
           // send Zoho's internal ID as invoiceNumber, so webhook can map it back
           invoiceNumber: invoiceId,
-          // but show the pretty number as description
+          // show the pretty number as description
           description: prettyNumber ? `Invoice ${prettyNumber}` : "Invoice",
         },
       },
@@ -340,13 +352,22 @@ app.get("/pay", async (req, res) => {
 
   try {
     const invoice = await getZohoInvoice(invoiceId);
-    const amount = invoice.balance || invoice.total;
+    const balance = Number(invoice.balance || 0);
+
+    // 👇 don’t let people pay invoices that are already paid
+    if (balance <= 0) {
+      return res
+        .status(400)
+        .send("<h2>This invoice is already paid.</h2>");
+    }
+
+    const amount = balance; // always use remaining balance
     const prettyNumber = invoice.invoice_number; // e.g. INV-001293
 
     const anetToken = await getAuthorizeNetToken({
       amount,
-      invoiceId,      // real Zoho ID
-      prettyNumber,   // human invoice number for description
+      invoiceId, // real Zoho ID
+      prettyNumber,
     });
 
     res.send(`
@@ -384,4 +405,3 @@ app.get("/payment-cancelled", (req, res) => {
 app.listen(PORT, () => {
   console.log(`server running on port ${PORT}`);
 });
-
