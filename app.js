@@ -354,7 +354,7 @@ app.get("/pay", async (req, res) => {
     const invoice = await getZohoInvoice(invoiceId);
     const balance = Number(invoice.balance || 0);
 
-    // 👇 don’t let people pay invoices that are already paid
+    // 👇 don't let people pay invoices that are already paid
     if (balance <= 0) {
       return res
         .status(400)
@@ -397,6 +397,269 @@ app.get("/payment-success", (req, res) => {
 });
 app.get("/payment-cancelled", (req, res) => {
   res.send("<h2>Payment cancelled.</h2>");
+});
+
+// =====================================================
+// QUOTE ENDPOINT - BigCommerce Integration
+// =====================================================
+
+// Helper: Search for existing Zoho Account
+async function searchZohoAccount(accountName, email) {
+  const accessToken = await getZohoAccessToken();
+  const searchCriteria = `((Account_Name:equals:${accountName})or(Email:equals:${email}))`;
+  const searchUrl = `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=${encodeURIComponent(searchCriteria)}`;
+  
+  const resp = await fetch(searchUrl, {
+    headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` }
+  });
+  
+  const data = await resp.json();
+  return data.data && data.data.length > 0 ? data.data[0] : null;
+}
+
+// Helper: Create new Zoho Account
+async function createZohoAccount(customerData) {
+  const accessToken = await getZohoAccessToken();
+  
+  const accountData = {
+    Account_Name: customerData.company || `${customerData.firstName} ${customerData.lastName}`,
+    Phone: customerData.phone,
+    Website: customerData.company ? `https://${customerData.company.toLowerCase().replace(/\s/g, '')}.com` : null,
+    Billing_Street: customerData.addressLine1,
+    Billing_City: customerData.city,
+    Billing_State: customerData.stateOrProvince,
+    Billing_Code: customerData.postalCode,
+    Billing_Country: customerData.countryCode || 'US'
+  };
+
+  const resp = await fetch('https://www.zohoapis.com/crm/v2/Accounts', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Zoho-oauthtoken ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ data: [accountData] })
+  });
+
+  const data = await resp.json();
+  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
+    throw new Error('Failed to create Zoho account');
+  }
+  
+  return data.data[0].details.id;
+}
+
+// Helper: Search for existing Zoho Contact
+async function searchZohoContact(email) {
+  const accessToken = await getZohoAccessToken();
+  const searchCriteria = `(Email:equals:${email})`;
+  const searchUrl = `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=${encodeURIComponent(searchCriteria)}`;
+  
+  const resp = await fetch(searchUrl, {
+    headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` }
+  });
+  
+  const data = await resp.json();
+  return data.data && data.data.length > 0 ? data.data[0] : null;
+}
+
+// Helper: Create new Zoho Contact
+async function createZohoContact(customerData, accountId) {
+  const accessToken = await getZohoAccessToken();
+  
+  const contactData = {
+    First_Name: customerData.firstName,
+    Last_Name: customerData.lastName,
+    Email: customerData.email,
+    Phone: customerData.phone,
+    Mailing_Street: customerData.addressLine1,
+    Mailing_City: customerData.city,
+    Mailing_State: customerData.stateOrProvince,
+    Mailing_Zip: customerData.postalCode,
+    Mailing_Country: customerData.countryCode || 'US',
+    Account_Name: { id: accountId }
+  };
+
+  const resp = await fetch('https://www.zohoapis.com/crm/v2/Contacts', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Zoho-oauthtoken ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ data: [contactData] })
+  });
+
+  const data = await resp.json();
+  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
+    throw new Error('Failed to create Zoho contact');
+  }
+  
+  return data.data[0].details.id;
+}
+
+// Helper: Create Zoho Deal
+async function createZohoDeal(customerData, accountId, contactId, cartTotal) {
+  const accessToken = await getZohoAccessToken();
+  
+  const dealData = {
+    Deal_Name: `Website Quote - ${customerData.firstName} ${customerData.lastName}`,
+    Stage: 'Quote Requested',
+    Account_Name: { id: accountId },
+    Contact_Name: { id: contactId },
+    Amount: cartTotal || 0,
+    Lead_Source: 'Website Quote Form',
+    Description: customerData.specialInstructions || 'Quote requested via website'
+  };
+
+  const resp = await fetch('https://www.zohoapis.com/crm/v2/Deals', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Zoho-oauthtoken ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ data: [dealData] })
+  });
+
+  const data = await resp.json();
+  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
+    throw new Error('Failed to create Zoho deal');
+  }
+  
+  return data.data[0].details.id;
+}
+
+// Helper: Create Zoho Quote
+async function createZohoQuote(dealId, contactId, items) {
+  const accessToken = await getZohoAccessToken();
+  
+  const lineItems = items.map(item => ({
+    product: item.zohoProductId ? { id: item.zohoProductId } : null,
+    Product_Name: item.name,
+    quantity: item.quantity,
+    list_price: 0, // Will be filled in by sales rep
+    Description: item.options ? JSON.stringify(item.options) : ''
+  }));
+
+  const quoteData = {
+    Subject: `Quote for Deal ${dealId}`,
+    Deal_Name: { id: dealId },
+    Contact_Name: { id: contactId },
+    Quote_Stage: 'Draft',
+    Product_Details: lineItems
+  };
+
+  const resp = await fetch('https://www.zohoapis.com/crm/v2/Quotes', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Zoho-oauthtoken ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ data: [quoteData] })
+  });
+
+  const data = await resp.json();
+  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
+    throw new Error('Failed to create Zoho quote');
+  }
+  
+  return data.data[0].details.id;
+}
+
+// Main quote endpoint
+app.post('/quote', async (req, res) => {
+  try {
+    console.log('📝 Quote request received:', JSON.stringify(req.body, null, 2));
+
+    const { customer, items, notes } = req.body;
+
+    // Validation
+    if (!customer || !customer.email || !customer.firstName || !customer.lastName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required customer information'
+      });
+    }
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No items in quote request'
+      });
+    }
+
+    // Step 1: Find or create Account
+    console.log('🏢 Searching for existing account...');
+    let accountId;
+    const existingAccount = await searchZohoAccount(
+      customer.company || `${customer.firstName} ${customer.lastName}`,
+      customer.email
+    );
+
+    if (existingAccount) {
+      console.log('✅ Found existing account:', existingAccount.id);
+      accountId = existingAccount.id;
+    } else {
+      console.log('➕ Creating new account...');
+      accountId = await createZohoAccount(customer);
+      console.log('✅ Created account:', accountId);
+    }
+
+    // Step 2: Find or create Contact
+    console.log('👤 Searching for existing contact...');
+    let contactId;
+    const existingContact = await searchZohoContact(customer.email);
+
+    if (existingContact) {
+      console.log('✅ Found existing contact:', existingContact.id);
+      contactId = existingContact.id;
+    } else {
+      console.log('➕ Creating new contact...');
+      contactId = await createZohoContact(customer, accountId);
+      console.log('✅ Created contact:', contactId);
+    }
+
+    // Step 3: Create Deal
+    console.log('💼 Creating deal...');
+    const cartTotal = items.reduce((sum, item) => sum + (item.quantity || 0), 0);
+    const dealId = await createZohoDeal(customer, accountId, contactId, cartTotal);
+    console.log('✅ Created deal:', dealId);
+
+    // Step 4: Create Quote
+    console.log('📄 Creating quote...');
+    const quoteId = await createZohoQuote(dealId, contactId, items);
+    console.log('✅ Created quote:', quoteId);
+
+    // Success!
+    console.log('🎉 Quote request processed successfully!');
+    res.json({
+      success: true,
+      message: 'Quote request submitted successfully! Our team will contact you shortly.',
+      data: {
+        accountId,
+        contactId,
+        dealId,
+        quoteId
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing quote:', error);
+    res.status(500).json({
+      success: false,
+      message: 'An error occurred while processing your quote request. Please try again or contact us directly.',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Test endpoint
+app.get('/quote/test', (req, res) => {
+  res.json({
+    status: 'Quote endpoint ready',
+    endpoint: 'POST /quote',
+    server: 'payments-nleq.onrender.com',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // =============================
