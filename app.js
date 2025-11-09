@@ -4,6 +4,7 @@ import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import cors from "cors"; // 👈 added
 
 dotenv.config();
 
@@ -54,7 +55,9 @@ async function getZohoAccessToken() {
   if (!data.access_token) {
     console.error("❌ Zoho token error:", data);
     throw new Error(
-      data.error_description || data.error || "Could not get Zoho access token",
+      data.error_description ||
+        data.error ||
+        "Could not get Zoho access token"
     );
   }
 
@@ -91,7 +94,7 @@ async function getZohoInvoice(invoiceId) {
 async function createZohoPaymentForInvoiceAmount(
   invoice,
   amount,
-  opts = {},
+  opts = {}
 ) {
   const accessToken = await getZohoAccessToken();
 
@@ -99,7 +102,7 @@ async function createZohoPaymentForInvoiceAmount(
     customer_id: invoice.customer_id,
     amount: amount,
     date: new Date().toISOString().slice(0, 10),
-    payment_mode: "Authorize.Net", // 👈 your label
+    payment_mode: "Authorize.Net",
     reference_number: opts.reference_number || "",
     description: opts.description || "",
     invoices: [
@@ -119,7 +122,7 @@ async function createZohoPaymentForInvoiceAmount(
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
-    },
+    }
   );
 
   const data = await resp.json();
@@ -140,7 +143,6 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
   console.log("Headers:", req.headers);
   console.log("Raw body:", req.body.toString());
 
-  // ----- signature check (case-insensitive) -----
   const sigHeader = req.headers["x-anet-signature"];
   let signatureOk = false;
 
@@ -168,7 +170,6 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
     console.log("❌ Missing signature header or ANET_WEBHOOK_KEY");
   }
 
-  // ----- parse body -----
   let event;
   try {
     event = JSON.parse(req.body.toString());
@@ -187,9 +188,8 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
 
   const payload = event.payload || {};
   const amount = payload.authAmount;
-  const anetTxnId = payload.id; // Authorize.Net transaction id
-  const anetInvoiceNumber = payload.invoiceNumber || ""; // should be Zoho internal ID now
-
+  const anetTxnId = payload.id;
+  const anetInvoiceNumber = payload.invoiceNumber || "";
   const zohoInvoiceId = anetInvoiceNumber;
 
   if (!zohoInvoiceId) {
@@ -197,22 +197,20 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
     return res.status(200).send("no invoice id");
   }
 
-  // fetch invoice so we can see balance and pretty number
   try {
     const invoice = await getZohoInvoice(zohoInvoiceId);
     const pretty = invoice.invoice_number;
     const invoiceBalance = Number(invoice.balance || 0);
     const paymentAmount = Number(amount || 0);
 
-    // 👇 guard against already-paid or overpayment
     if (invoiceBalance <= 0) {
       console.log(
         "ℹ️ Invoice has no balance left in Zoho, skipping payment. Invoice:",
-        zohoInvoiceId,
+        zohoInvoiceId
       );
     } else if (paymentAmount > invoiceBalance + 0.0001) {
       console.log(
-        `ℹ️ Payment (${paymentAmount}) is more than invoice balance (${invoiceBalance}), skipping.`,
+        `ℹ️ Payment (${paymentAmount}) is more than invoice balance (${invoiceBalance}), skipping.`
       );
     } else {
       await createZohoPaymentForInvoiceAmount(invoice, paymentAmount, {
@@ -223,7 +221,7 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
         "✅ Recorded payment in Zoho for",
         zohoInvoiceId,
         "amount",
-        paymentAmount,
+        paymentAmount
       );
     }
   } catch (err) {
@@ -234,8 +232,31 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
 });
 
 // =====================================================
-// 2) parse JSON for everything else
+// 2) GLOBAL MIDDLEWARE (CORS + JSON) FOR EVERYTHING ELSE
 // =====================================================
+
+// allow your store to call this API
+const allowedOrigins = [
+  "https://fdfloors.com",
+  "https://store-goibpuywu8.mybigcommerce.com", // BC store/admin preview
+];
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+  })
+);
+
+// let preflight through
+app.options("*", cors());
+
+// now parse normal JSON
 app.use(express.json());
 
 // =============================
@@ -286,10 +307,10 @@ async function getAuthorizeNetToken({ amount, invoiceId, prettyNumber }) {
   }
 
   const successUrl = `${BASE_URL}/payment-success?invoice_id=${encodeURIComponent(
-    invoiceId,
+    invoiceId
   )}`;
   const cancelUrl = `${BASE_URL}/payment-cancelled?invoice_id=${encodeURIComponent(
-    invoiceId,
+    invoiceId
   )}`;
 
   const payload = {
@@ -302,9 +323,7 @@ async function getAuthorizeNetToken({ amount, invoiceId, prettyNumber }) {
         transactionType: "authCaptureTransaction",
         amount: Number(amount).toFixed(2),
         order: {
-          // send Zoho's internal ID as invoiceNumber, so webhook can map it back
           invoiceNumber: invoiceId,
-          // show the pretty number as description
           description: prettyNumber ? `Invoice ${prettyNumber}` : "Invoice",
         },
       },
@@ -354,19 +373,16 @@ app.get("/pay", async (req, res) => {
     const invoice = await getZohoInvoice(invoiceId);
     const balance = Number(invoice.balance || 0);
 
-    // 👇 don't let people pay invoices that are already paid
     if (balance <= 0) {
-      return res
-        .status(400)
-        .send("<h2>This invoice is already paid.</h2>");
+      return res.status(400).send("<h2>This invoice is already paid.</h2>");
     }
 
-    const amount = balance; // always use remaining balance
-    const prettyNumber = invoice.invoice_number; // e.g. INV-001293
+    const amount = balance;
+    const prettyNumber = invoice.invoice_number;
 
     const anetToken = await getAuthorizeNetToken({
       amount,
-      invoiceId, // real Zoho ID
+      invoiceId,
       prettyNumber,
     });
 
@@ -403,70 +419,74 @@ app.get("/payment-cancelled", (req, res) => {
 // QUOTE ENDPOINT - BigCommerce Integration
 // =====================================================
 
-// Helper: Search for existing Zoho Account
 async function searchZohoAccount(accountName, email) {
   const accessToken = await getZohoAccessToken();
   const searchCriteria = `((Account_Name:equals:${accountName})or(Email:equals:${email}))`;
-  const searchUrl = `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=${encodeURIComponent(searchCriteria)}`;
-  
+  const searchUrl = `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=${encodeURIComponent(
+    searchCriteria
+  )}`;
+
   const resp = await fetch(searchUrl, {
-    headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` }
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
-  
+
   const data = await resp.json();
   return data.data && data.data.length > 0 ? data.data[0] : null;
 }
 
-// Helper: Create new Zoho Account
 async function createZohoAccount(customerData) {
   const accessToken = await getZohoAccessToken();
-  
+
   const accountData = {
-    Account_Name: customerData.company || `${customerData.firstName} ${customerData.lastName}`,
+    Account_Name:
+      customerData.company ||
+      `${customerData.firstName} ${customerData.lastName}`,
     Phone: customerData.phone,
-    Website: customerData.company ? `https://${customerData.company.toLowerCase().replace(/\s/g, '')}.com` : null,
+    Website: customerData.company
+      ? `https://${customerData.company.toLowerCase().replace(/\s/g, "")}.com`
+      : null,
     Billing_Street: customerData.addressLine1,
     Billing_City: customerData.city,
     Billing_State: customerData.stateOrProvince,
     Billing_Code: customerData.postalCode,
-    Billing_Country: customerData.countryCode || 'US'
+    Billing_Country: customerData.countryCode || "US",
   };
 
-  const resp = await fetch('https://www.zohoapis.com/crm/v2/Accounts', {
-    method: 'POST',
+  const resp = await fetch("https://www.zohoapis.com/crm/v2/Accounts", {
+    method: "POST",
     headers: {
-      'Authorization': `Zoho-oauthtoken ${accessToken}`,
-      'Content-Type': 'application/json'
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [accountData] })
+    body: JSON.stringify({ data: [accountData] }),
   });
 
   const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
-    throw new Error('Failed to create Zoho account');
+  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
+    throw new Error("Failed to create Zoho account");
   }
-  
+
   return data.data[0].details.id;
 }
 
-// Helper: Search for existing Zoho Contact
 async function searchZohoContact(email) {
   const accessToken = await getZohoAccessToken();
   const searchCriteria = `(Email:equals:${email})`;
-  const searchUrl = `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=${encodeURIComponent(searchCriteria)}`;
-  
+  const searchUrl = `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=${encodeURIComponent(
+    searchCriteria
+  )}`;
+
   const resp = await fetch(searchUrl, {
-    headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` }
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
-  
+
   const data = await resp.json();
   return data.data && data.data.length > 0 ? data.data[0] : null;
 }
 
-// Helper: Create new Zoho Contact
 async function createZohoContact(customerData, accountId) {
   const accessToken = await getZohoAccessToken();
-  
+
   const contactData = {
     First_Name: customerData.firstName,
     Last_Name: customerData.lastName,
@@ -476,119 +496,117 @@ async function createZohoContact(customerData, accountId) {
     Mailing_City: customerData.city,
     Mailing_State: customerData.stateOrProvince,
     Mailing_Zip: customerData.postalCode,
-    Mailing_Country: customerData.countryCode || 'US',
-    Account_Name: { id: accountId }
+    Mailing_Country: customerData.countryCode || "US",
+    Account_Name: { id: accountId },
   };
 
-  const resp = await fetch('https://www.zohoapis.com/crm/v2/Contacts', {
-    method: 'POST',
+  const resp = await fetch("https://www.zohoapis.com/crm/v2/Contacts", {
+    method: "POST",
     headers: {
-      'Authorization': `Zoho-oauthtoken ${accessToken}`,
-      'Content-Type': 'application/json'
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [contactData] })
+    body: JSON.stringify({ data: [contactData] }),
   });
 
   const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
-    throw new Error('Failed to create Zoho contact');
+  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
+    throw new Error("Failed to create Zoho contact");
   }
-  
+
   return data.data[0].details.id;
 }
 
-// Helper: Create Zoho Deal
 async function createZohoDeal(customerData, accountId, contactId, cartTotal) {
   const accessToken = await getZohoAccessToken();
-  
+
   const dealData = {
     Deal_Name: `Website Quote - ${customerData.firstName} ${customerData.lastName}`,
-    Stage: 'Quote Requested',
+    Stage: "Quote Requested",
     Account_Name: { id: accountId },
     Contact_Name: { id: contactId },
     Amount: cartTotal || 0,
-    Lead_Source: 'Website Quote Form',
-    Description: customerData.specialInstructions || 'Quote requested via website'
+    Lead_Source: "Website Quote Form",
+    Description:
+      customerData.specialInstructions || "Quote requested via website",
   };
 
-  const resp = await fetch('https://www.zohoapis.com/crm/v2/Deals', {
-    method: 'POST',
+  const resp = await fetch("https://www.zohoapis.com/crm/v2/Deals", {
+    method: "POST",
     headers: {
-      'Authorization': `Zoho-oauthtoken ${accessToken}`,
-      'Content-Type': 'application/json'
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [dealData] })
+    body: JSON.stringify({ data: [dealData] }),
   });
 
   const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
-    throw new Error('Failed to create Zoho deal');
+  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
+    throw new Error("Failed to create Zoho deal");
   }
-  
+
   return data.data[0].details.id;
 }
 
-// Helper: Create Zoho Quote
 async function createZohoQuote(dealId, contactId, items) {
   const accessToken = await getZohoAccessToken();
-  
-  const lineItems = items.map(item => ({
+
+  const lineItems = items.map((item) => ({
     product: item.zohoProductId ? { id: item.zohoProductId } : null,
     Product_Name: item.name,
     quantity: item.quantity,
-    list_price: 0, // Will be filled in by sales rep
-    Description: item.options ? JSON.stringify(item.options) : ''
+    list_price: 0,
+    Description: item.options ? JSON.stringify(item.options) : "",
   }));
 
   const quoteData = {
     Subject: `Quote for Deal ${dealId}`,
     Deal_Name: { id: dealId },
     Contact_Name: { id: contactId },
-    Quote_Stage: 'Draft',
-    Product_Details: lineItems
+    Quote_Stage: "Draft",
+    Product_Details: lineItems,
   };
 
-  const resp = await fetch('https://www.zohoapis.com/crm/v2/Quotes', {
-    method: 'POST',
+  const resp = await fetch("https://www.zohoapis.com/crm/v2/Quotes", {
+    method: "POST",
     headers: {
-      'Authorization': `Zoho-oauthtoken ${accessToken}`,
-      'Content-Type': 'application/json'
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [quoteData] })
+    body: JSON.stringify({ data: [quoteData] }),
   });
 
   const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== 'SUCCESS') {
-    throw new Error('Failed to create Zoho quote');
+  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
+    throw new Error("Failed to create Zoho quote");
   }
-  
+
   return data.data[0].details.id;
 }
 
 // Main quote endpoint
-app.post('/quote', async (req, res) => {
+app.post("/quote", async (req, res) => {
   try {
-    console.log('📝 Quote request received:', JSON.stringify(req.body, null, 2));
+    console.log("📝 Quote request received:", JSON.stringify(req.body, null, 2));
 
     const { customer, items, notes } = req.body;
 
-    // Validation
     if (!customer || !customer.email || !customer.firstName || !customer.lastName) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required customer information'
+        message: "Missing required customer information",
       });
     }
 
     if (!items || items.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No items in quote request'
+        message: "No items in quote request",
       });
     }
 
-    // Step 1: Find or create Account
-    console.log('🏢 Searching for existing account...');
+    // Step 1: Account
+    console.log("🏢 Searching for existing account...");
     let accountId;
     const existingAccount = await searchZohoAccount(
       customer.company || `${customer.firstName} ${customer.lastName}`,
@@ -596,69 +614,77 @@ app.post('/quote', async (req, res) => {
     );
 
     if (existingAccount) {
-      console.log('✅ Found existing account:', existingAccount.id);
+      console.log("✅ Found existing account:", existingAccount.id);
       accountId = existingAccount.id;
     } else {
-      console.log('➕ Creating new account...');
+      console.log("➕ Creating new account...");
       accountId = await createZohoAccount(customer);
-      console.log('✅ Created account:', accountId);
+      console.log("✅ Created account:", accountId);
     }
 
-    // Step 2: Find or create Contact
-    console.log('👤 Searching for existing contact...');
+    // Step 2: Contact
+    console.log("👤 Searching for existing contact...");
     let contactId;
     const existingContact = await searchZohoContact(customer.email);
 
     if (existingContact) {
-      console.log('✅ Found existing contact:', existingContact.id);
+      console.log("✅ Found existing contact:", existingContact.id);
       contactId = existingContact.id;
     } else {
-      console.log('➕ Creating new contact...');
+      console.log("➕ Creating new contact...");
       contactId = await createZohoContact(customer, accountId);
-      console.log('✅ Created contact:', contactId);
+      console.log("✅ Created contact:", contactId);
     }
 
-    // Step 3: Create Deal
-    console.log('💼 Creating deal...');
-    const cartTotal = items.reduce((sum, item) => sum + (item.quantity || 0), 0);
-    const dealId = await createZohoDeal(customer, accountId, contactId, cartTotal);
-    console.log('✅ Created deal:', dealId);
+    // Step 3: Deal
+    console.log("💼 Creating deal...");
+    const cartTotal = items.reduce(
+      (sum, item) => sum + (item.quantity || 0),
+      0
+    );
+    const dealId = await createZohoDeal(
+      customer,
+      accountId,
+      contactId,
+      cartTotal
+    );
+    console.log("✅ Created deal:", dealId);
 
-    // Step 4: Create Quote
-    console.log('📄 Creating quote...');
+    // Step 4: Quote
+    console.log("📄 Creating quote...");
     const quoteId = await createZohoQuote(dealId, contactId, items);
-    console.log('✅ Created quote:', quoteId);
+    console.log("✅ Created quote:", quoteId);
 
-    // Success!
-    console.log('🎉 Quote request processed successfully!');
+    console.log("🎉 Quote request processed successfully!");
     res.json({
       success: true,
-      message: 'Quote request submitted successfully! Our team will contact you shortly.',
+      message:
+        "Quote request submitted successfully! Our team will contact you shortly.",
       data: {
         accountId,
         contactId,
         dealId,
-        quoteId
-      }
+        quoteId,
+      },
     });
-
   } catch (error) {
-    console.error('❌ Error processing quote:', error);
+    console.error("❌ Error processing quote:", error);
     res.status(500).json({
       success: false,
-      message: 'An error occurred while processing your quote request. Please try again or contact us directly.',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message:
+        "An error occurred while processing your quote request. Please try again or contact us directly.",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
 // Test endpoint
-app.get('/quote/test', (req, res) => {
+app.get("/quote/test", (req, res) => {
   res.json({
-    status: 'Quote endpoint ready',
-    endpoint: 'POST /quote',
-    server: 'payments-nleq.onrender.com',
-    timestamp: new Date().toISOString()
+    status: "Quote endpoint ready",
+    endpoint: "POST /quote",
+    server: "payments-nleq.onrender.com",
+    timestamp: new Date().toISOString(),
   });
 });
 
