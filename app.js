@@ -433,7 +433,7 @@ async function searchZohoAccount(accountName, email) {
   return data.data && data.data.length > 0 ? data.data[0] : null;
 }
 
-// Helper: Create new Zoho Account
+// Helper: Create new Zoho Account (with logging + Email + real error output)
 async function createZohoAccount(customerData) {
   const accessToken = await getZohoAccessToken();
 
@@ -441,16 +441,19 @@ async function createZohoAccount(customerData) {
     Account_Name:
       customerData.company ||
       `${customerData.firstName} ${customerData.lastName}`,
-    Phone: customerData.phone,
+    Phone: customerData.phone || null,
+    Email: customerData.email || null, // <-- add Email so we can search by it too
     Website: customerData.company
       ? `https://${customerData.company.toLowerCase().replace(/\s/g, "")}.com`
       : null,
-    Billing_Street: customerData.addressLine1,
-    Billing_City: customerData.city,
-    Billing_State: customerData.state || customerData.stateOrProvince,
-    Billing_Code: customerData.postalCode || customerData.zip,
+    Billing_Street: customerData.addressLine1 || null,
+    Billing_City: customerData.city || null,
+    Billing_State: customerData.state || customerData.stateOrProvince || null,
+    Billing_Code: customerData.postalCode || customerData.zip || null,
     Billing_Country: customerData.countryCode || "US",
   };
+
+  console.log("📦 Creating Zoho Account with data:", accountData);
 
   const resp = await fetch("https://www.zohoapis.com/crm/v2/Accounts", {
     method: "POST",
@@ -462,12 +465,33 @@ async function createZohoAccount(customerData) {
   });
 
   const data = await resp.json();
+  console.log(
+    "📥 Zoho Accounts create response:",
+    JSON.stringify(data, null, 2)
+  );
+
+  // HTTP-level failure
+  if (!resp.ok) {
+    throw new Error(
+      `Failed to create Zoho account (HTTP ${resp.status}): ${
+        data.message || "Unknown HTTP error"
+      }`
+    );
+  }
+
+  // CRM-level failure
   if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
-    throw new Error("Failed to create Zoho account");
+    const first = data.data && data.data[0];
+    const msg =
+      (first && first.message) ||
+      data.message ||
+      JSON.stringify(data);
+    throw new Error(`Failed to create Zoho account: ${msg}`);
   }
 
   return data.data[0].details.id;
 }
+
 
 
 // Helper: Search for existing Zoho Contact
