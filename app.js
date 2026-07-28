@@ -46,6 +46,30 @@ const ANET_ENFORCE_SIG = process.env.ANET_ENFORCE_SIG === "true";
 // exactly what let us diagnose the signature mismatch.
 const WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === "true";
 
+// Every webhook in seven days of logs came from this IP. Cloudflare fronts
+// Render, so cf-connecting-ip is set by Cloudflare and can't be forged by the
+// sender. Used as a fallback check while the signature key is unresolved:
+// accept if the signature verifies OR the source IP is Authorize.Net.
+// OFF by default. Seven days of logs is thin evidence that Authorize.Net only
+// ever sends from one IP — if they rotate, this would silently stop payments
+// recording. Turn it on deliberately, not as a side effect of a feature deploy.
+const ANET_IP_GUARD = process.env.ANET_IP_GUARD === "true";
+
+const ANET_IPS = (process.env.ANET_WEBHOOK_IPS || "198.241.206.38")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+function clientIp(req) {
+  return String(
+    req.headers["cf-connecting-ip"] ||
+      req.headers["true-client-ip"] ||
+      String(req.headers["x-forwarded-for"] || "").split(",")[0] ||
+      req.ip ||
+      ""
+  ).trim();
+}
+
 // =============================
 // ZOHO TOKEN CACHE
 // =============================
@@ -318,14 +342,22 @@ app.post("/anet-webhook", express.raw({ type: "*/*" }), async (req, res) => {
   // POST a fake authcapture event and have Books record a payment that never
   // happened. Return 200 so Authorize.Net doesn't retry-storm a forgery.
   // ---------------------------------------------------------------------
+  const srcIp = clientIp(req);
+  const ipOk = ANET_IPS.includes(srcIp);
+
   if (!signatureOk) {
     if (ANET_ENFORCE_SIG) {
-      console.log("🚫 REJECTED unsigned/invalid webhook — no payment recorded");
+      console.log("🚫 REJECTED — signature invalid and enforcement is on. IP:", srcIp);
       return res.status(200).send("bad signature");
     }
+    if (ANET_IP_GUARD && !ipOk) {
+      console.log("🚫 REJECTED — bad signature from non-Authorize.Net IP:", srcIp);
+      return res.status(200).send("rejected");
+    }
     console.log(
-      "⚠️  UNVERIFIED webhook processed. ANET_ENFORCE_SIG is off — anyone who " +
-        "can guess a Zoho invoice id can forge a payment. Run check-anet-key.js."
+      "⚠️  Signature not verified. Source IP:", srcIp,
+      ipOk ? "(matches Authorize.Net)" : "(NOT a known Authorize.Net IP)",
+      "— processing anyway. ANET_IP_GUARD and ANET_ENFORCE_SIG are both off."
     );
   }
 
@@ -443,6 +475,8 @@ const quoteFlow = mountAcceptQuote(app, {
   PAY_BASE: BASE_URL,
   PAY_PATH: "/pay",
   QUOTE_PAGE: process.env.QUOTE_PAGE || "https://fdfloors.com/quote/",
+  QUOTE_PAGE_PF:
+    process.env.QUOTE_PAGE_PF || "https://pocatelloflooring.com/quote/",
   EMAIL_DELAY_MIN: process.env.EMAIL_DELAY_MIN,
   VOID_UNPAID_DAYS: process.env.VOID_UNPAID_DAYS,
 });
@@ -465,6 +499,8 @@ app.get("/debug/env", requireDebugKey, (req, res) => {
     ANET_ENFORCE_SIG,
     WEBHOOK_VERBOSE,
     RATE_LIMITS_ON,
+    ANET_IP_GUARD,
+    ANET_IPS,
     BASE_URL,
   });
 });
@@ -999,7 +1035,10 @@ if (!process.env.QUOTE_LINK_SECRET) {
   console.warn("⚠️  QUOTE_LINK_SECRET not set — quote links will not validate");
 }
 if (!ANET_ENFORCE_SIG) {
-  console.warn("🚨 ANET_ENFORCE_SIG is OFF — webhook signatures are logged but not enforced");
+  console.warn(
+    "⚠️  ANET_ENFORCE_SIG is OFF. Webhook signatures logged, not enforced." +
+      (ANET_IP_GUARD ? " IP guard ON: " + ANET_IPS.join(", ") : " IP guard OFF.")
+  );
 }
 
 // =============================
