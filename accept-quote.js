@@ -14,7 +14,7 @@
  *     Pay later ->  POST /api/q/:id/later    unpaid invoice emailed now
  *     Abandons  ->  20-min timer or /q/sweep  unpaid invoice emailed
  *
- * Legacy GET /q/:num 302-redirects to the BigCommerce page, so links already
+ * Legacy GET /q/:id 302-redirects to the BigCommerce page, so links already
  * sitting in customer inboxes keep working.
  *
  * !! BOOKS SETUP - READ THIS !!
@@ -308,7 +308,7 @@ export default function mountAcceptQuote(app, opts) {
     const exp = String(req.query.e || ''), sig = String(req.query.t || '');
     if (!exp || !sig) return 'Missing link signature.';
     if (Number(exp) * 1000 < Date.now()) return 'This quote link has expired.';
-    const a = Buffer.from(sign(num, exp)), b = Buffer.from(sig);
+    const a = Buffer.from(sign(id, exp)), b = Buffer.from(sig);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return 'Invalid link.';
     return null;
   }
@@ -492,29 +492,29 @@ export default function mountAcceptQuote(app, opts) {
     const repEmail = await repEmailFor(quote);
 
     const paid = kind === 'paid';
-    const subject = paid
-      ? 'Payment received - ' + brand.name + ' invoice ' + inv.invoice_number
-      : 'Your ' + brand.name + ' invoice ' + inv.invoice_number;
-    const body = paid
-      ? ['Thank you - we received your payment of ' + money(inv.total) + '.',
-         '',
-         'Your materials are on order. We will call you to schedule installation as soon as they arrive.',
-         '',
-         'Your paid invoice is attached for your records.',
-         '',
-         brand.name + '  |  ' + brand.phone].join('\n')
-      : ['Thanks for accepting your quote.',
-         '',
-         'Your invoice for materials is attached. You can pay online using the button below, or stop by either showroom and we will take care of it there.',
-         '',
-         'Materials are ordered once payment is received.',
-         '',
-         brand.name + '  |  ' + brand.phone].join('\n');
 
-    const mail = { subject, body, send_customer_statement: false };
+    // UNPAID: send nothing custom. Books' own Estimates/Invoices template is
+    // already branded per showroom, shows the amount and due date, and carries
+    // a working PAY NOW button into /pay?invoice_id=. Passing subject/body here
+    // would override all of that with plain text.
+    //
+    // PAID: the standard template still shows PAY NOW on a settled invoice,
+    // which is confusing, so this one case gets custom copy.
+    const mail = {};
+    if (paid) {
+      mail.subject = 'Payment received - ' + brand.name + ' invoice ' + inv.invoice_number;
+      mail.body = [
+        'Thank you - we received your payment of ' + money(inv.total) + '.',
+        '',
+        'Your materials are on order. We will call you to schedule installation as soon as they arrive.',
+        '',
+        'Your paid invoice is attached for your records.',
+        '',
+        brand.name + '  |  ' + brand.phone
+      ].join('\n');
+    }
     if (repEmail) {
-      // Reply-to the rep so a customer reply lands with the person who built
-      // the quote, without needing every rep verified as a Books sender.
+      // Reply-to the rep so a customer reply reaches whoever built the quote.
       mail.reply_to = repEmail;
       mail.reply_to_mail_ids = [repEmail];
     }
