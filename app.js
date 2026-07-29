@@ -477,6 +477,11 @@ const quoteFlow = mountAcceptQuote(app, {
   QUOTE_PAGE: process.env.QUOTE_PAGE || "https://fdfloors.com/quote/",
   QUOTE_PAGE_PF:
     process.env.QUOTE_PAGE_PF || "https://pocatelloflooring.com/quote/",
+  // CRM writes go through the Quote_Event standalone function with API-key
+  // auth — same pattern as the Cloudflare Workers. ZOHO_REFRESH_TOKEN carries
+  // Books scopes only.
+  ZOHO_API_KEY: process.env.ZOHO_API_KEY,
+  CRM_FN_URL: process.env.CRM_FN_URL,
   EMAIL_DELAY_MIN: process.env.EMAIL_DELAY_MIN,
   VOID_UNPAID_DAYS: process.env.VOID_UNPAID_DAYS,
 });
@@ -496,6 +501,7 @@ app.get("/debug/env", requireDebugKey, (req, res) => {
     ANET_KEY: !!ANET_KEY,
     ANET_WEBHOOK_KEY: !!ANET_WEBHOOK_KEY,
     QUOTE_LINK_SECRET: !!process.env.QUOTE_LINK_SECRET,
+    ZOHO_API_KEY: !!process.env.ZOHO_API_KEY,
     ANET_ENFORCE_SIG,
     WEBHOOK_VERBOSE,
     RATE_LIMITS_ON,
@@ -711,319 +717,13 @@ app.get("/payment-cancelled", (req, res) => {
 });
 
 // =====================================================
-// QUOTE ENDPOINT - BigCommerce Integration
+// (removed) POST /quote + CRM helpers
+//
+// Dead code. The BigCommerce cart quote form has always gone
+//   cart.html -> fdf-quote-proxy.jordan-7f1.workers.dev -> website_quote_request
+// authenticating with zapikey, never through here. This endpoint was public,
+// unused, and created CRM records if it had worked.
 // =====================================================
-
-// Helper: Search for existing Zoho Account
-async function searchZohoAccount(accountName, email) {
-  const accessToken = await getZohoAccessToken();
-  const searchCriteria = `((Account_Name:equals:${accountName})or(Email:equals:${email}))`;
-  const searchUrl = `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=${encodeURIComponent(
-    searchCriteria
-  )}`;
-
-  const resp = await fetch(searchUrl, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-  });
-
-  const data = await resp.json();
-  return data.data && data.data.length > 0 ? data.data[0] : null;
-}
-
-// Helper: Create new Zoho Account (with logging + Email + real error output)
-async function createZohoAccount(customerData) {
-  const accessToken = await getZohoAccessToken();
-
-  const accountData = {
-    Account_Name:
-      customerData.company ||
-      `${customerData.firstName} ${customerData.lastName}`,
-    Phone: customerData.phone || null,
-    Email: customerData.email || null, // <-- add Email so we can search by it too
-    Website: customerData.company
-      ? `https://${customerData.company.toLowerCase().replace(/\s/g, "")}.com`
-      : null,
-    Billing_Street: customerData.addressLine1 || null,
-    Billing_City: customerData.city || null,
-    Billing_State: customerData.state || customerData.stateOrProvince || null,
-    Billing_Code: customerData.postalCode || customerData.zip || null,
-    Billing_Country: customerData.countryCode || "US",
-  };
-
-  console.log("📦 Creating Zoho Account with data:", accountData);
-
-  const resp = await fetch("https://www.zohoapis.com/crm/v2/Accounts", {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ data: [accountData] }),
-  });
-
-  const data = await resp.json();
-  console.log(
-    "📥 Zoho Accounts create response:",
-    JSON.stringify(data, null, 2)
-  );
-
-  // HTTP-level failure
-  if (!resp.ok) {
-    throw new Error(
-      `Failed to create Zoho account (HTTP ${resp.status}): ${
-        data.message || "Unknown HTTP error"
-      }`
-    );
-  }
-
-  // CRM-level failure
-  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
-    const first = data.data && data.data[0];
-    const msg =
-      (first && first.message) ||
-      data.message ||
-      JSON.stringify(data);
-    throw new Error(`Failed to create Zoho account: ${msg}`);
-  }
-
-  return data.data[0].details.id;
-}
-
-// Helper: Search for existing Zoho Contact
-async function searchZohoContact(email) {
-  const accessToken = await getZohoAccessToken();
-  const searchCriteria = `(Email:equals:${email})`;
-  const searchUrl = `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=${encodeURIComponent(
-    searchCriteria
-  )}`;
-
-  const resp = await fetch(searchUrl, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-  });
-
-  const data = await resp.json();
-  return data.data && data.data.length > 0 ? data.data[0] : null;
-}
-
-// Helper: Create new Zoho Contact
-async function createZohoContact(customerData, accountId) {
-  const accessToken = await getZohoAccessToken();
-
-  const contactData = {
-    First_Name: customerData.firstName,
-    Last_Name: customerData.lastName,
-    Email: customerData.email,
-    Phone: customerData.phone,
-    Mailing_Street: customerData.addressLine1,
-    Mailing_City: customerData.city,
-    Mailing_State: customerData.state || customerData.stateOrProvince,
-    Mailing_Zip: customerData.postalCode || customerData.zip,
-    Mailing_Country: customerData.countryCode || "US",
-    Account_Name: { id: accountId },
-  };
-
-  const resp = await fetch("https://www.zohoapis.com/crm/v2/Contacts", {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ data: [contactData] }),
-  });
-
-  const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
-    throw new Error("Failed to create Zoho contact");
-  }
-
-  return data.data[0].details.id;
-}
-
-// Helper: Create Zoho Deal
-async function createZohoDeal(customerData, accountId, contactId, cartTotal) {
-  const accessToken = await getZohoAccessToken();
-
-  const dealData = {
-    Deal_Name: `Website Quote - ${customerData.firstName} ${customerData.lastName}`,
-    Stage: "Quote Requested",
-    Account_Name: { id: accountId },
-    Contact_Name: { id: contactId },
-    Amount: cartTotal || 0,
-    Lead_Source: "Website Quote Form",
-    Description:
-      customerData.specialInstructions ||
-      customerData.comments ||
-      "Quote requested via website",
-  };
-
-  const resp = await fetch("https://www.zohoapis.com/crm/v2/Deals", {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ data: [dealData] }),
-  });
-
-  const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
-    throw new Error("Failed to create Zoho deal");
-  }
-
-  return data.data[0].details.id;
-}
-
-// Helper: Create Zoho Quote
-async function createZohoQuote(dealId, contactId, items) {
-  const accessToken = await getZohoAccessToken();
-
-  const lineItems = items.map((item) => ({
-    product: item.zohoProductId ? { id: item.zohoProductId } : null,
-    Product_Name: item.name,
-    quantity: item.quantity,
-    list_price: 0,
-    Description: item.options ? JSON.stringify(item.options) : "",
-  }));
-
-  const quoteData = {
-    Subject: `Quote for Deal ${dealId}`,
-    Deal_Name: { id: dealId },
-    Contact_Name: { id: contactId },
-    Quote_Stage: "Draft",
-    Product_Details: lineItems,
-  };
-
-  const resp = await fetch("https://www.zohoapis.com/crm/v2/Quotes", {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ data: [quoteData] }),
-  });
-
-  const data = await resp.json();
-  if (!data.data || !data.data[0] || data.data[0].code !== "SUCCESS") {
-    throw new Error("Failed to create Zoho quote");
-  }
-
-  return data.data[0].details.id;
-}
-
-// Main quote endpoint — public, so throttled and input-capped
-app.post("/quote", rateLimit(5, 10 * 60 * 1000), async (req, res) => {
-  try {
-    console.log("📝 Quote request received:", JSON.stringify(req.body, null, 2));
-
-    const { customer, items, notes } = req.body;
-
-    if (
-      !customer ||
-      !customer.email ||
-      !customer.firstName ||
-      !customer.lastName
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required customer information",
-      });
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(customer.email))) {
-      return res.status(400).json({
-        success: false,
-        message: "Please enter a valid email address",
-      });
-    }
-
-    if (!items || items.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "No items in quote request",
-      });
-    }
-
-    if (items.length > 200) {
-      return res.status(400).json({
-        success: false,
-        message: "Too many items in this request",
-      });
-    }
-
-    // 1) account
-    let accountId;
-    const existingAccount = await searchZohoAccount(
-      customer.company || `${customer.firstName} ${customer.lastName}`,
-      customer.email
-    );
-
-    if (existingAccount) {
-      accountId = existingAccount.id;
-      console.log("✅ Found existing account:", accountId);
-    } else {
-      accountId = await createZohoAccount(customer);
-      console.log("✅ Created account:", accountId);
-    }
-
-    // 2) contact
-    let contactId;
-    const existingContact = await searchZohoContact(customer.email);
-    if (existingContact) {
-      contactId = existingContact.id;
-      console.log("✅ Found existing contact:", contactId);
-    } else {
-      contactId = await createZohoContact(customer, accountId);
-      console.log("✅ Created contact:", contactId);
-    }
-
-    // 3) deal
-    const cartTotal = items.reduce(
-      (sum, item) => sum + (item.quantity || 0),
-      0
-    );
-    const dealId = await createZohoDeal(
-      { ...customer, specialInstructions: notes },
-      accountId,
-      contactId,
-      cartTotal
-    );
-    console.log("✅ Created deal:", dealId);
-
-    // 4) quote
-    const quoteId = await createZohoQuote(dealId, contactId, items);
-    console.log("✅ Created quote:", quoteId);
-
-    res.json({
-      success: true,
-      message:
-        "Quote request submitted successfully! Our team will contact you shortly.",
-      data: {
-        accountId,
-        contactId,
-        dealId,
-        quoteId,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Error processing quote:", error);
-    res.status(500).json({
-      success: false,
-      message:
-        "An error occurred while processing your quote request. Please try again or contact us directly.",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
-
-// Test endpoint
-app.get("/quote/test", (req, res) => {
-  res.json({
-    status: "Quote endpoint ready",
-    endpoint: "POST /quote",
-    server: "payments-nleq.onrender.com",
-    timestamp: new Date().toISOString(),
-  });
-});
 
 // =============================
 // STARTUP CHECKS
@@ -1033,6 +733,9 @@ if (!DEBUG_KEY) {
 }
 if (!process.env.QUOTE_LINK_SECRET) {
   console.warn("⚠️  QUOTE_LINK_SECRET not set — quote links will not validate");
+}
+if (!process.env.ZOHO_API_KEY) {
+  console.warn("⚠️  ZOHO_API_KEY not set — no CRM notes or Quote_Response updates");
 }
 if (!ANET_ENFORCE_SIG) {
   console.warn(
