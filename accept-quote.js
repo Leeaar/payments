@@ -225,54 +225,54 @@ export default function mountAcceptQuote(app, opts) {
     return body;
   }
 
-  // -- Zoho CRM ---------------------------------------------------------------
-  // Render doesn't email reps. It writes to the Deal and a CRM workflow rule
-  // emails the Deal Owner, so notifications follow record ownership instead of
-  // a list that goes stale.
-  const CRM = 'https://www.zohoapis.com/crm/v2';
-  const DEAL_FIELD = opts.DEAL_STATUS_FIELD || process.env.DEAL_STATUS_FIELD || 'Quote_Response';
+  // -- Zoho CRM via standalone function ---------------------------------------
+  //
+  // Render's ZOHO_REFRESH_TOKEN carries Books scopes only — CRM writes over
+  // OAuth return 401. Rather than rotating the token, this calls a CRM
+  // standalone function with API-key auth, the same pattern the Cloudflare
+  // Workers use for website_quote_request and Contractor_Registration. Deluge
+  // inside CRM needs no API scopes to write its own Notes.
+  const CRM_FN_URL = opts.CRM_FN_URL || process.env.CRM_FN_URL ||
+    'https://www.zohoapis.com/crm/v7/functions/Quote_Event/actions/execute';
+  const ZOHO_API_KEY = opts.ZOHO_API_KEY || process.env.ZOHO_API_KEY || '';
 
-  async function crm(method, path, data) {
-    const token = await getZohoToken();
-    const resp = await fetch(CRM + path, {
-      method: method.toUpperCase(),
-      headers: {
-        Authorization: 'Zoho-oauthtoken ' + token,
-        'Content-Type': 'application/json'
-      },
-      body: data ? JSON.stringify(data) : undefined
-    });
-    let body = null;
-    try { body = await resp.json(); } catch (e) { body = null; }
-    if (!resp.ok) throw new Error('CRM ' + method + ' ' + path + ' -> HTTP ' + resp.status);
-    return body;
-  }
-
-  async function noteOnDeal(dealId, title, content) {
-    if (!dealId) return;
-    try {
-      await crm('post', '/Notes', {
-        data: [{
-          Note_Title: String(title).slice(0, 120),
-          Note_Content: String(content).slice(0, 32000),
-          Parent_Id: String(dealId),
-          se_module: 'Deals'
-        }]
-      });
-    } catch (e) {
-      console.error('[accept-quote] CRM note failed for deal ' + dealId + ': ' + e.message);
+  /**
+   * One call writes the Note and sets Quote_Response. Fire-and-forget: it must
+   * never be able to fail a quote acceptance.
+   */
+  async function crmEvent(dealId, title, details, status) {
+    if (!dealId) {
+      console.warn('[accept-quote] no zcrm_potential_id — nothing to attach "' +
+        title + '" to');
+      return;
     }
-  }
-
-  /** Setting this field is what a CRM workflow rule listens for. */
-  async function setDealStatus(dealId, value) {
-    if (!dealId) return;
+    if (!ZOHO_API_KEY) {
+      console.warn('[accept-quote] ZOHO_API_KEY not set — skipping CRM event: ' + title);
+      return;
+    }
     try {
-      const payload = { data: [{ id: String(dealId) }], trigger: ['workflow'] };
-      payload.data[0][DEAL_FIELD] = value;
-      await crm('put', '/Deals', payload);
+      const args = {
+        dealId: String(dealId),
+        title: String(title).slice(0, 120),
+        details: String(details).slice(0, 4000),
+        status: status || ''
+      };
+      const url = CRM_FN_URL +
+        '?auth_type=apikey&zapikey=' + encodeURIComponent(ZOHO_API_KEY) +
+        '&arguments=' + encodeURIComponent(JSON.stringify(args));
+      const resp = await fetch(url, { method: 'POST' });
+      let body = null;
+      try { body = await resp.json(); } catch (e) { body = null; }
+      const out = body && body.details && body.details.output;
+      if (resp.ok && String(out || '').indexOf('NOTE_OK') !== -1) {
+        console.log('[accept-quote] CRM event on deal ' + dealId + ': ' + title +
+          ' (' + out + ')');
+      } else {
+        console.error('[accept-quote] CRM event failed on deal ' + dealId + ': ' +
+          resp.status + ' ' + JSON.stringify(body));
+      }
     } catch (e) {
-      console.error('[accept-quote] CRM deal update failed ' + dealId + ': ' + e.message);
+      console.error('[accept-quote] CRM event error on deal ' + dealId + ': ' + e.message);
     }
   }
 
@@ -500,7 +500,14 @@ export default function mountAcceptQuote(app, opts) {
     //
     // PAID: the standard template still shows PAY NOW on a settled invoice,
     // which is confusing, so this one case gets custom copy.
-    const mail = {};
+    const toIds = await recipientsFor(inv, quote);
+    if (!toIds.length) {
+      console.error('[accept-quote] NO RECIPIENT for invoice ' + inv.invoice_number +
+        ' — cannot email. Check the customer has a contact person with an email.');
+      return { error: 'no recipient' };
+    }
+
+    const mail = { to_mail_ids: toIds };
     if (paid) {
       mail.subject = 'Payment received - ' + brand.name + ' invoice ' + inv.invoice_number;
       mail.body = [
@@ -513,11 +520,15 @@ export default function mountAcceptQuote(app, opts) {
         brand.name + '  |  ' + brand.phone
       ].join('\n');
     }
-    if (repEmail) {
-      // Reply-to the rep so a customer reply reaches whoever built the quote.
+    // reply_to / reply_to_mail_ids are still unverified against this endpoint.
+    // If Books starts rejecting them the way it rejected to_mail_ids, set
+    // REPLY_TO=off rather than redeploying.
+    if (repEmail && String(opts.REPLY_TO || process.env.REPLY_TO || 'on') !== 'off') {
       mail.reply_to = repEmail;
       mail.reply_to_mail_ids = [repEmail];
     }
+    console.log('[accept-quote] emailing ' + inv.invoice_number + ' (' + kind + ') to ' +
+      toIds.join(', ') + (repEmail ? ' reply-to ' + repEmail : ''));
     await books('post', '/invoices/' + invoiceId + '/email', { data: mail });
     await setCf(invoiceId, 'invoices', { cf_invoice_emailed: paid ? 'paid' : 'unpaid' }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
 
@@ -533,13 +544,37 @@ export default function mountAcceptQuote(app, opts) {
       }
     }
     if (paid && quote) {
-      noteOnDeal(quote.zcrm_potential_id, 'PAYMENT RECEIVED - ' + quote.estimate_number,
+      crmEvent(quote.zcrm_potential_id, 'PAYMENT RECEIVED - ' + quote.estimate_number,
         'Materials paid in full: ' + money(inv.total) + ' on invoice ' + inv.invoice_number +
-        '.\nMaterials can be ordered.');
-      setDealStatus(quote.zcrm_potential_id, 'Paid');
+        '.\nMaterials can be ordered.', 'Paid');
     }
     console.log('[accept-quote] emailed ' + kind + ' invoice ' + inv.invoice_number);
     return { sent: true };
+  }
+
+  /**
+   * Books rejects POST /invoices/{id}/email without explicit recipients —
+   * "Invalid value passed for to_mail_ids". Confirmed on a live send.
+   * Tries the invoice's contact persons, then the estimate's, then the
+   * customer record.
+   */
+  async function recipientsFor(inv, est) {
+    const out = [];
+    const push = (arr) => (arr || []).forEach((c) => {
+      if (c && c.email) out.push(String(c.email).trim());
+    });
+    push(inv && inv.contact_persons_details);
+    if (!out.length) push(est && est.contact_persons_details);
+    if (!out.length && inv && inv.customer_id) {
+      try {
+        const c = await books('get', '/contacts/' + inv.customer_id);
+        push(c.contact && c.contact.contact_persons);
+        if (!out.length && c.contact && c.contact.email) out.push(String(c.contact.email).trim());
+      } catch (e) {
+        console.error('[accept-quote] contact lookup failed: ' + e.message);
+      }
+    }
+    return Array.from(new Set(out.filter(Boolean)));
   }
 
   /** Call from your existing webhook after the payment is recorded. */
@@ -655,15 +690,14 @@ export default function mountAcceptQuote(app, opts) {
 
       scheduleFallback(invoice.invoice_id);
 
-      noteOnDeal(est.zcrm_potential_id, 'QUOTE ACCEPTED - ' + est.estimate_number,
+      crmEvent(est.zcrm_potential_id, 'QUOTE ACCEPTED - ' + est.estimate_number,
         'Customer accepted online.\n' +
         'Sales Order: ' + so.salesorder_number + '\n' +
         'Invoice: ' + invoice.invoice_number + ' for ' + money(invoice.total) + ' (materials)\n' +
         (deferred.length
           ? 'Installation stays open on the sales order, invoiced on completion.\n'
           : '') +
-        'Payment not yet received.');
-      setDealStatus(est.zcrm_potential_id, 'Accepted');
+        'Payment not yet received.', 'Accepted');
 
       console.log('[accept-quote] accepted ' + est.estimate_number +
         ' SO=' + so.salesorder_number + ' INV=' + invoice.invoice_number);
@@ -705,14 +739,17 @@ export default function mountAcceptQuote(app, opts) {
       const s = await splitLines(est);
 
       // First view only — a customer refreshing shouldn't spam the Deal.
-      if (!cf(est, 'cf_first_viewed')) {
+      const seenBefore = cf(est, 'cf_first_viewed');
+      console.log('[accept-quote] view ' + est.estimate_number +
+        ' deal=' + (est.zcrm_potential_id || 'NONE') +
+        ' firstView=' + (seenBefore ? 'no (' + seenBefore + ')' : 'yes'));
+      if (!seenBefore) {
         setCf(est.estimate_id, 'estimates',
           { cf_first_viewed: new Date().toISOString() }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
-        noteOnDeal(est.zcrm_potential_id, 'Quote opened by customer',
+        crmEvent(est.zcrm_potential_id, 'Quote opened by customer',
           'Quote ' + est.estimate_number + ' was opened online on ' +
           new Date().toLocaleString('en-US', { timeZone: 'America/Boise' }) +
-          '. Materials due on acceptance: ' + money(s.preview) + '.');
-        setDealStatus(est.zcrm_potential_id, 'Viewed');
+          '. Materials due on acceptance: ' + money(s.preview) + '.', 'Viewed');
       }
 
       res.json({
@@ -802,10 +839,9 @@ export default function mountAcceptQuote(app, opts) {
       }
       await books('post', '/estimates/' + est.estimate_id + '/status/declined');
 
-      noteOnDeal(est.zcrm_potential_id, 'QUOTE DECLINED - ' + est.estimate_number,
+      crmEvent(est.zcrm_potential_id, 'QUOTE DECLINED - ' + est.estimate_number,
         'Customer declined online.\nReason given: ' + (reason || 'none given') +
-        '\nQuote total: ' + money(est.total));
-      setDealStatus(est.zcrm_potential_id, 'Declined');
+        '\nQuote total: ' + money(est.total), 'Declined');
 
       console.log('[accept-quote] DECLINED ' + est.estimate_number +
         ' (' + (est.salesperson_name || 'no rep') + ') reason=' + (reason || 'none given'));
