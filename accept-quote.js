@@ -232,8 +232,11 @@ export default function mountAcceptQuote(app, opts) {
   // standalone function with API-key auth, the same pattern the Cloudflare
   // Workers use for website_quote_request and Contractor_Registration. Deluge
   // inside CRM needs no API scopes to write its own Notes.
+  // v2, not v7. apikey auth on function execution is a v2 endpoint — v7 falls
+  // through to OAuth and answers INVALID_TOKEN. Your Cloudflare Workers call
+  // website_quote_request on v2 for the same reason.
   const CRM_FN_URL = opts.CRM_FN_URL || process.env.CRM_FN_URL ||
-    'https://www.zohoapis.com/crm/v7/functions/Quote_Event/actions/execute';
+    'https://www.zohoapis.com/crm/v2/functions/Quote_Event/actions/execute';
   const ZOHO_API_KEY = opts.ZOHO_API_KEY || process.env.ZOHO_API_KEY || '';
 
   /**
@@ -599,7 +602,12 @@ export default function mountAcceptQuote(app, opts) {
         if (cf(inv, 'cf_invoice_emailed')) return;
         await sendInvoiceEmail(invoiceId, Number(inv.balance) === 0 ? 'paid' : 'unpaid');
       } catch (e) {
-        console.error('[accept-quote] fallback ' + invoiceId, e.message);
+        // Deleted invoices are normal during testing — nothing to chase.
+        if (String(e.message).indexOf('does not exist') !== -1) {
+          console.log('[accept-quote] fallback skipped, invoice ' + invoiceId + ' is gone');
+        } else {
+          console.error('[accept-quote] fallback ' + invoiceId, e.message);
+        }
       }
     }, delayMs);
     timers.set(key, t);
@@ -618,6 +626,13 @@ export default function mountAcceptQuote(app, opts) {
 
       const split = await splitLines(est);
       const material = split.material, deferred = split.deferred;
+      // Carry the showroom through so the SO and invoice can be reported on by
+      // brand. Set after creation rather than in the payload: cf_showroom is
+      // confirmed on Estimates and Invoices but not on Sales Orders, and an
+      // unknown custom field fails the whole create with code 120138.
+      const showroom = String(((est.custom_field_hash || {}).cf_showroom) || '').trim();
+      // Link both records to the same CRM Deal the quote belongs to.
+      const dealId = String(est.zcrm_potential_id || '').trim();
       if (!material.length) throw new Error('No material lines to invoice.');
 
       // 1. Sales order - full scope, materials and labor.
@@ -625,6 +640,7 @@ export default function mountAcceptQuote(app, opts) {
         data: {
           customer_id: est.customer_id,
           reference_number: est.estimate_number,
+          zcrm_potential_id: dealId || undefined,
           date: new Date().toISOString().slice(0, 10),
           notes: est.notes, terms: est.terms,
           salesperson_name: est.salesperson_name,
@@ -639,6 +655,11 @@ export default function mountAcceptQuote(app, opts) {
         }
       })).salesorder;
       await books('post', '/salesorders/' + so.salesorder_id + '/approve').catch(() => {});
+      if (showroom) {
+        await setCf(so.salesorder_id, 'salesorders', { cf_showroom: showroom })
+          .catch(e => console.error('[accept-quote] showroom not set on ' +
+            so.salesorder_number + ': ' + e.message));
+      }
 
       // 2. Invoice - material lines only, linked to the SO so Books tracks
       //    quantity_invoiced and the labor stays open on the order.
@@ -655,6 +676,7 @@ export default function mountAcceptQuote(app, opts) {
         data: {
           customer_id: est.customer_id,
           reference_number: est.estimate_number,
+          zcrm_potential_id: dealId || undefined,
           date: new Date().toISOString().slice(0, 10),
           // No document-level salesorder_id — not a documented create param.
           // Per-line salesorder_item_id is what links back to the SO and drives
@@ -678,10 +700,12 @@ export default function mountAcceptQuote(app, opts) {
       // cf_invoice_id on Invoices is a FORMULA field — read-only, and it already
       // computes to the invoice id, which is what your webhook keys off. Don't
       // write it; writing a formula field errors or is silently dropped.
-      await setCf(invoice.invoice_id, 'invoices', {
+      const invFields = {
         cf_accepted_at: new Date().toISOString(),
         cf_invoice_emailed: ''
-      }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
+      };
+      if (showroom) invFields.cf_showroom = showroom;
+      await setCf(invoice.invoice_id, 'invoices', invFields).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
 
       await setCf(est.estimate_id, 'estimates', {
         cf_so_id: so.salesorder_id, cf_invoice_id: invoice.invoice_id
