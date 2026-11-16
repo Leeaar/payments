@@ -831,10 +831,13 @@ export default function mountAcceptQuote(app, opts) {
       res.json({
         ok: true,
         state: Number(invoice.balance) === 0 ? 'paid' : 'accepted',
+        quoteNumber: est.estimate_number,
+        customerName: est.customer_name,
         invoiceNumber: invoice.invoice_number,
         total: Number(invoice.total),
         balance: Number(invoice.balance),
         hasInstall: Number(invoice.total) < Number(est.total),
+        channel: isWeb(est) ? 'web' : 'showroom',
         payUrl: payUrlFor(invoice.invoice_id)
       });
     } catch (e) {
