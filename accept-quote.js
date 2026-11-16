@@ -284,6 +284,9 @@ export default function mountAcceptQuote(app, opts) {
     for (let i = 0; i < l.length; i++) if (l[i].api_name === name) return l[i].value;
     return null;
   };
+  // Web-form quotes (website_quote_request sets cf_quote_source = "Web") are
+  // shipped, materials-only orders; the page and emails use shipping copy.
+  const isWeb = est => String(cf(est, 'cf_quote_source') || '').toLowerCase() === 'web';
   /**
    * Verified against this org: Books accepts api_name in custom_fields and
    * validates it against the schema, returning 400 / code 120138 naming the
@@ -521,7 +524,9 @@ export default function mountAcceptQuote(app, opts) {
       mail.body = [
         'Thank you - we received your payment of ' + money(inv.total) + '.',
         '',
-        'Your materials are on order. We will call you to schedule installation as soon as they arrive.',
+        (quote && isWeb(quote)
+          ? 'Your order is being prepared. Most in-stock orders ship within 3-5 business days, and we will email tracking as soon as it leaves our warehouse.'
+          : 'Your materials are on order. We will call you to schedule installation as soon as they arrive.'),
         '',
         'Your paid invoice is attached for your records.',
         '',
@@ -761,6 +766,7 @@ export default function mountAcceptQuote(app, opts) {
           total: Number(inv.total),
           balance: Number(inv.balance),
           hasInstall: Number(inv.total) < Number(est.total),
+          channel: isWeb(est) ? 'web' : 'showroom',
           payUrl: payUrlFor(inv.invoice_id)
         });
       }
@@ -791,6 +797,7 @@ export default function mountAcceptQuote(app, opts) {
         deferred: s.deferred.map(wireLine),
         dueToday: s.preview,
         brand: brandFor(est).key,
+        channel: isWeb(est) ? 'web' : 'showroom',
         terms: est.terms || '',
         materialsSubtotal: s.matNet,
         discountToday: s.discount,
