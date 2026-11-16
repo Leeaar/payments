@@ -187,6 +187,8 @@ export default function mountAcceptQuote(app, opts) {
   const accepting = new Set();
   const timers = new Map(); // fast path; the sweep is the durable one
   const pdfCache = new Map(); // estimate_id -> { buf, at }
+  const viewAlerts = new Map(); // estimate_id -> last view alert (ms)
+  const VIEW_ALERT_GAP = 10 * 60 * 1000;
 
   const payUrlFor = id => payBase + payPath + '?invoice_id=' + id;
 
@@ -236,7 +238,7 @@ export default function mountAcceptQuote(app, opts) {
   // through to OAuth and answers INVALID_TOKEN. Your Cloudflare Workers call
   // website_quote_request on v2 for the same reason.
   const CRM_FN_URL = opts.CRM_FN_URL || process.env.CRM_FN_URL ||
-    'https://www.zohoapis.com/crm/v2/functions/Quote_Event/actions/execute';
+    'https://www.zohoapis.com/crm/v7/functions/quote_event/actions/execute';
   const ZOHO_API_KEY = opts.ZOHO_API_KEY || process.env.ZOHO_API_KEY || '';
 
   /**
@@ -773,18 +775,29 @@ export default function mountAcceptQuote(app, opts) {
 
       const s = await splitLines(est);
 
-      // First view only — a customer refreshing shouldn't spam the Deal.
+      // Every view is reported (Quote_Event emails the deal owner + Aaron), but a
+      // customer refreshing within VIEW_ALERT_GAP only counts once.
       const seenBefore = cf(est, 'cf_first_viewed');
+      const viewKey = String(est.estimate_id);
+      const lastAlert = viewAlerts.get(viewKey) || 0;
+      const alertNow = Date.now() - lastAlert > VIEW_ALERT_GAP;
       console.log('[accept-quote] view ' + est.estimate_number +
         ' deal=' + (est.zcrm_potential_id || 'NONE') +
-        ' firstView=' + (seenBefore ? 'no (' + seenBefore + ')' : 'yes'));
+        ' firstView=' + (seenBefore ? 'no (' + seenBefore + ')' : 'yes') +
+        ' alert=' + (alertNow ? 'yes' : 'no (recent)'));
       if (!seenBefore) {
         setCf(est.estimate_id, 'estimates',
           { cf_first_viewed: new Date().toISOString() }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
-        crmEvent(est.zcrm_potential_id, 'Quote opened by customer',
-          'Quote ' + est.estimate_number + ' was opened online on ' +
-          new Date().toLocaleString('en-US', { timeZone: 'America/Boise' }) +
-          '. Materials due on acceptance: ' + money(s.preview) + '.', 'Viewed');
+      }
+      if (alertNow) {
+        viewAlerts.set(viewKey, Date.now());
+        crmEvent(est.zcrm_potential_id,
+          (seenBefore ? 'Quote re-opened by customer - ' : 'Quote opened by customer - ') + est.estimate_number,
+          'Quote ' + est.estimate_number + ' (' + (est.customer_name || 'customer') + ', ' +
+          money(Number(est.total || 0)) + ') was ' + (seenBefore ? 're-opened' : 'opened') +
+          ' online on ' + new Date().toLocaleString('en-US', { timeZone: 'America/Boise' }) +
+          (seenBefore ? '. First opened ' + new Date(seenBefore).toLocaleString('en-US', { timeZone: 'America/Boise' }) : '') +
+          '. Due on acceptance: ' + money(s.preview) + '.', 'Viewed');
       }
 
       res.json({
