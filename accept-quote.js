@@ -895,14 +895,16 @@ export default function mountAcceptQuote(app, opts) {
       const est = await loadEstimate(id);
       if (!est) return res.status(404).json({ error: 'Quote not found.' });
 
-      const key = String(est.estimate_id);
+      // Key on the estimate's last edit so a rep's change shows immediately
+      // instead of serving the old PDF until the TTL runs out.
+      const key = String(est.estimate_id) + '@' + String(est.last_modified_time || '');
       const now = Date.now();
       for (const [k, v] of pdfCache) if (now - v.at > PDF_TTL) pdfCache.delete(k);
 
       let buf = pdfCache.has(key) ? pdfCache.get(key).buf : null;
       if (!buf) {
         const token = await getZohoToken();
-        const pdfUrl = new URL(BOOKS + '/estimates/' + key);
+        const pdfUrl = new URL(BOOKS + '/estimates/' + String(est.estimate_id));
         pdfUrl.searchParams.set('organization_id', ORG_ID);
         pdfUrl.searchParams.set('accept', 'pdf');
         const r = await fetch(pdfUrl.toString(), {
@@ -916,7 +918,8 @@ export default function mountAcceptQuote(app, opts) {
       res.set('Content-Type', 'application/pdf');
       res.set('Content-Disposition',
         'inline; filename="Quote-' + String(id).replace(/[^\w.-]/g, '') + '.pdf"');
-      res.set('Cache-Control', 'private, max-age=300');
+      // No browser caching: the URL never changes, so a cached copy would hide edits.
+      res.set('Cache-Control', 'private, no-store');
       res.send(buf);
     } catch (e) {
       console.error('[accept-quote] PDF ' + id, e.message);
