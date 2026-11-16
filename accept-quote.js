@@ -464,11 +464,16 @@ export default function mountAcceptQuote(app, opts) {
     // them after tax, so add at the end rather than into the taxable base.
     const adjustment = r2(Number(est.adjustment || 0));
 
+    // Freight (Books "Shipping Charges") bills today with materials — acceptQuote
+    // passes est.shipping_charge straight onto the invoice. No shipping tax id is
+    // sent to the invoice, so it's added untaxed here to match.
+    const shipping = r2(Number(est.shipping_charge || 0));
+
     // Display estimate. Books remains the authority on the real invoice total.
-    const preview = r2(matNet - matDisc + tax + adjustment);
+    const preview = r2(matNet - matDisc + tax + adjustment + shipping);
     return {
       material, deferred, handjam, matNet, allNet,
-      discount: matDisc, tax, adjustment,
+      discount: matDisc, tax, adjustment, shipping,
       adjustmentLabel: est.adjustment_description || 'Adjustment',
       preview
     };
@@ -790,8 +795,13 @@ export default function mountAcceptQuote(app, opts) {
         materialsSubtotal: s.matNet,
         discountToday: s.discount,
         taxToday: s.tax,
-        adjustmentToday: s.adjustment,
-        adjustmentLabel: s.adjustmentLabel,
+        // The quote page renders one extra row from adjustmentToday/Label, so
+        // freight rides in that row until the page gets its own Freight line.
+        adjustmentToday: r2(s.adjustment + s.shipping),
+        adjustmentLabel: s.shipping && s.adjustment
+          ? 'Freight & ' + s.adjustmentLabel.toLowerCase()
+          : (s.shipping ? 'Freight' : s.adjustmentLabel),
+        shippingToday: s.shipping,
         deferredTotal: r2(s.deferred.reduce(function (a, l) {
           return a + Number(l.item_total || 0); }, 0)),
         quoteTotal: Number(est.total || 0),
