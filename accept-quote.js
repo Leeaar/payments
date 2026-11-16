@@ -238,8 +238,13 @@ export default function mountAcceptQuote(app, opts) {
   // through to OAuth and answers INVALID_TOKEN. Your Cloudflare Workers call
   // website_quote_request on v2 for the same reason.
   const CRM_FN_URL = opts.CRM_FN_URL || process.env.CRM_FN_URL ||
-    'https://www.zohoapis.com/crm/v7/functions/quote_event/actions/execute';
-  const ZOHO_API_KEY = opts.ZOHO_API_KEY || process.env.ZOHO_API_KEY || '';
+    'https://www.zohoapis.com/crm/v2/functions/Quote_Event/actions/execute';
+  // Accept either the bare key or the whole "…&zapikey=XYZ" URL pasted from CRM.
+  const ZOHO_API_KEY = (function (raw) {
+    const s = String(raw || '').trim();
+    const m = s.match(/zapikey=([^&\s]+)/);
+    return m ? decodeURIComponent(m[1]) : s;
+  })(opts.ZOHO_API_KEY || process.env.ZOHO_API_KEY || '');
 
   /**
    * One call writes the Note and sets Quote_Response. Fire-and-forget: it must
