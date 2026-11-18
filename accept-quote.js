@@ -506,18 +506,28 @@ export default function mountAcceptQuote(app, opts) {
     if (!quote && inv.reference_number) {
       try { quote = await loadEstimate(inv.reference_number); } catch (e) { quote = null; }
     }
-    const brand = brandFor(quote);
     const repEmail = await repEmailFor(quote);
 
     const paid = kind === 'paid';
+
+    // PAID: no customer email at all — no paid-invoice email and no Books
+    // payment receipt. Mark the invoice so the fallback sweep doesn't retry,
+    // and still log the payment on the CRM deal.
+    if (paid) {
+      await setCf(invoiceId, 'invoices', { cf_invoice_emailed: 'paid' }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
+      if (quote) {
+        crmEvent(quote.zcrm_potential_id, 'PAYMENT RECEIVED - ' + quote.estimate_number,
+          'Materials paid in full: ' + money(inv.total) + ' on invoice ' + inv.invoice_number +
+          '.\nMaterials can be ordered.', 'Paid');
+      }
+      console.log('[accept-quote] paid ' + inv.invoice_number + ' — no customer email sent');
+      return { skipped: true, reason: 'paid emails disabled' };
+    }
 
     // UNPAID: send nothing custom. Books' own Estimates/Invoices template is
     // already branded per showroom, shows the amount and due date, and carries
     // a working PAY NOW button into /pay?invoice_id=. Passing subject/body here
     // would override all of that with plain text.
-    //
-    // PAID: the standard template still shows PAY NOW on a settled invoice,
-    // which is confusing, so this one case gets custom copy.
     const toIds = await recipientsFor(inv, quote);
     if (!toIds.length) {
       console.error('[accept-quote] NO RECIPIENT for invoice ' + inv.invoice_number +
@@ -526,20 +536,6 @@ export default function mountAcceptQuote(app, opts) {
     }
 
     const mail = { to_mail_ids: toIds };
-    if (paid) {
-      mail.subject = 'Payment received - ' + brand.name + ' invoice ' + inv.invoice_number;
-      mail.body = [
-        'Thank you - we received your payment of ' + money(inv.total) + '.',
-        '',
-        (quote && isWeb(quote)
-          ? 'Your order is being prepared. Most in-stock orders ship within 3-5 business days, and we will email tracking as soon as it leaves our warehouse.'
-          : 'Your materials are on order. We will call you to schedule installation as soon as they arrive.'),
-        '',
-        'Your paid invoice is attached for your records.',
-        '',
-        brand.name + '  |  ' + brand.phone
-      ].join('\n');
-    }
     // reply_to / reply_to_mail_ids are still unverified against this endpoint.
     // If Books starts rejecting them the way it rejected to_mail_ids, set
     // REPLY_TO=off rather than redeploying.
@@ -550,16 +546,8 @@ export default function mountAcceptQuote(app, opts) {
     console.log('[accept-quote] emailing ' + inv.invoice_number + ' (' + kind + ') to ' +
       toIds.join(', ') + (repEmail ? ' reply-to ' + repEmail : ''));
     await books('post', '/invoices/' + invoiceId + '/email', { data: mail });
-    await setCf(invoiceId, 'invoices', { cf_invoice_emailed: paid ? 'paid' : 'unpaid' }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
+    await setCf(invoiceId, 'invoices', { cf_invoice_emailed: 'unpaid' }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
 
-    // No separate Books payment receipt / thank-you email. With no recipients
-    // passed, Books sent it to every contact person on the customer. The paid
-    // invoice above is the only confirmation the customer gets.
-    if (paid && quote) {
-      crmEvent(quote.zcrm_potential_id, 'PAYMENT RECEIVED - ' + quote.estimate_number,
-        'Materials paid in full: ' + money(inv.total) + ' on invoice ' + inv.invoice_number +
-        '.\nMaterials can be ordered.', 'Paid');
-    }
     console.log('[accept-quote] emailed ' + kind + ' invoice ' + inv.invoice_number);
     return { sent: true };
   }
