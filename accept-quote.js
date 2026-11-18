@@ -552,17 +552,9 @@ export default function mountAcceptQuote(app, opts) {
     await books('post', '/invoices/' + invoiceId + '/email', { data: mail });
     await setCf(invoiceId, 'invoices', { cf_invoice_emailed: paid ? 'paid' : 'unpaid' }).catch(e => console.error('[accept-quote] setCf failed: ' + e.message));
 
-    if (paid) {
-      // Best effort. The paid invoice above already reads as a confirmation.
-      try {
-        const pay = await books('get', '/customerpayments', { params: { invoice_id: invoiceId } });
-        const pid = pay.customerpayments && pay.customerpayments[0]
-          ? pay.customerpayments[0].payment_id : null;
-        if (pid) await books('post', '/customerpayments/' + pid + '/email', { data: {} });
-      } catch (e) {
-        console.warn('[accept-quote] receipt email skipped: ' + e.message);
-      }
-    }
+    // No separate Books payment receipt / thank-you email. With no recipients
+    // passed, Books sent it to every contact person on the customer. The paid
+    // invoice above is the only confirmation the customer gets.
     if (paid && quote) {
       crmEvent(quote.zcrm_potential_id, 'PAYMENT RECEIVED - ' + quote.estimate_number,
         'Materials paid in full: ' + money(inv.total) + ' on invoice ' + inv.invoice_number +
