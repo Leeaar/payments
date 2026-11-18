@@ -5,6 +5,7 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import mountAcceptQuote from "./accept-quote.js";
+import mountInvoiceView from "./invoice-view.js";
 
 dotenv.config();
 
@@ -468,7 +469,16 @@ app.use(express.json({ limit: "256kb" }));
 // =====================================================
 // Mounted here on purpose: the CORS middleware above only covers routes
 // declared after it, so these inherit it.
+// Branded invoice page (/i) + PDF download (/i/pdf) + Books link webhook.
+const invoiceView = mountInvoiceView(app, {
+  getZohoToken: getZohoAccessToken,
+  ORG_ID: ZOHO_ORG_ID,
+  LINK_SECRET: process.env.QUOTE_LINK_SECRET,
+  BASE_URL,
+});
+
 const quoteFlow = mountAcceptQuote(app, {
+  ENSURE_INVOICE_LINK: invoiceView.ensureLink,
   getZohoToken: getZohoAccessToken,
   ORG_ID: ZOHO_ORG_ID,
   LINK_SECRET: process.env.QUOTE_LINK_SECRET,

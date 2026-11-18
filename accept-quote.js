@@ -511,6 +511,15 @@ export default function mountAcceptQuote(app, opts) {
 
     const paid = kind === 'paid';
 
+    // Every invoice email links to the branded invoice page (/i), which has the
+    // PDF download. Books' template reads it from cf_invoice_link, so it has to
+    // be on the invoice before the email goes out.
+    let viewLink = '';
+    if (typeof opts.ENSURE_INVOICE_LINK === 'function') {
+      try { viewLink = await opts.ENSURE_INVOICE_LINK(inv); }
+      catch (e) { console.error('[accept-quote] invoice link failed: ' + e.message); }
+    }
+
     // UNPAID: send nothing custom. Books' own Estimates/Invoices template is
     // already branded per showroom, shows the amount and due date, and carries
     // a working PAY NOW button into /pay?invoice_id=. Passing subject/body here
@@ -535,7 +544,9 @@ export default function mountAcceptQuote(app, opts) {
           ? 'Your order is being prepared. Most in-stock orders ship within 3-5 business days, and we will email tracking as soon as it leaves our warehouse.'
           : 'Your materials are on order. We will call you to schedule installation as soon as they arrive.'),
         '',
-        'Your paid invoice is attached for your records.',
+        (viewLink
+          ? 'View or download your paid invoice anytime:\n' + viewLink
+          : 'Reply to this email if you need a copy of your invoice.'),
         '',
         brand.name + '  |  ' + brand.phone
       ].join('\n');
